@@ -166,7 +166,7 @@ pub fn github_repo() -> String {
         .unwrap_or_else(|| DEFAULT_GITHUB_REPO.to_string())
 }
 
-const NOTIFICATION_ICON: &[u8] = include_bytes!("../assets/icon-64.png");
+const NOTIFICATION_ICON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icon-64.png"));
 
 pub fn register_app_id() {
     let key = format!(r"Software\Classes\AppUserModelId\{}", crate::notify::APP_ID);

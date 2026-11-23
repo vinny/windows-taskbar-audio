@@ -1,6 +1,6 @@
 [package]
 name = "taskbar-audio"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "Volume, active audio device, per-app mixer, and call indicator on the Windows taskbar"
 license = "MIT"
@@ -48,6 +48,7 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [build-dependencies]
+resvg = "0.44"
 winresource = "0.1"
 
 [profile.release]

@@ -548,7 +548,7 @@ unsafe fn paint_flyout(hwnd: HWND, target_dc: HDC) {
 
     // Header: active device icon + full device name + optional "In call" badge
     SelectObject(dc, icon_font);
-    SetTextColor(dc, accent);
+    SetTextColor(dc, if snap.master_muted { muted_col } else { fg_col });
     let dev_glyph = wide(device_icon(
         snap.device_kind,
         snap.master_volume,

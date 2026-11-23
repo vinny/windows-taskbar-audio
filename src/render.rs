@@ -72,10 +72,8 @@ pub unsafe fn draw(
 ) -> (i32, i32) {
     let s = |v: i32| v * dpi as i32 / 96;
     let fg = if light { 0x000000 } else { 0xFFFFFF };
-    let sub_fg = if light { 0x333333 } else { 0xD0D0D0 };
     let muted_red = if light { 0xC42B1C } else { 0xFF6B6B };
-    // Vibrant emerald/amber accent when in communication mode (Teams / Discord / active mic)
-    let comm_color = if light { 0x0F7B0F } else { 0x50E3C2 };
+    let comm_color = if light { 0x0F7B0F } else { 0x6CCB5F };
 
     let mut segs = Vec::new();
     let seg = |text: &str, icon: bool, color: u32, opacity: u32, gap_after: i32| Seg {
@@ -90,16 +88,10 @@ pub unsafe fn draw(
         gap_after,
     };
 
-    let main_color = if snap.master_muted {
-        muted_red
-    } else if snap.in_communication {
-        comm_color
-    } else {
-        fg
-    };
+    let main_color = if snap.master_muted { muted_red } else { fg };
     let main_opacity = if snap.master_muted { 195 } else { 255 };
 
-    // 1. Device / volume icon
+    // 1. Device / volume icon (natural taskbar theme color, matching taskbar-battery)
     let icon_glyph = device_icon(snap.device_kind, snap.master_volume, snap.master_muted);
     segs.push(seg(icon_glyph, true, main_color, main_opacity, s(5)));
 
@@ -109,19 +101,23 @@ pub unsafe fn draw(
     } else {
         format!("{}%", snap.master_volume)
     };
-    let has_extra = (show_device_label && !snap.device_short_name.is_empty()) || snap.in_communication;
+    let has_extra =
+        (show_device_label && !snap.device_short_name.is_empty()) || snap.in_communication;
     segs.push(seg(
         &vol_text,
         false,
-        if snap.master_muted { muted_red } else { fg },
+        main_color,
         main_opacity,
         if has_extra { s(6) } else { 0 },
     ));
 
     // 3. Optional short device name on horizontal taskbars
-    if matches!(layout, Layout::Row { .. }) && show_device_label && !snap.device_short_name.is_empty() {
+    if matches!(layout, Layout::Row { .. })
+        && show_device_label
+        && !snap.device_short_name.is_empty()
+    {
         let gap = if snap.in_communication { s(6) } else { 0 };
-        segs.push(seg(&snap.device_short_name, false, sub_fg, 220, gap));
+        segs.push(seg(&snap.device_short_name, false, fg, 220, gap));
     }
 
     // 4. Communication mode indicator (Teams / Discord / Call active)
@@ -132,7 +128,7 @@ pub unsafe fn draw(
     let screen = GetDC(null_mut());
     let dc = CreateCompatibleDC(screen);
     ReleaseDC(null_mut(), screen);
-    let text_font = font("Segoe UI", -s(12), FW_SEMIBOLD as i32);
+    let text_font = font("Segoe UI", -s(12), FW_NORMAL as i32);
     let icon_font = font("Segoe Fluent Icons", -s(15), FW_NORMAL as i32);
 
     // Measure segments
