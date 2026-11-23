@@ -561,11 +561,12 @@ unsafe fn show_menu(hwnd: HWND) {
         keep(&mut labels, tr.start_with_windows),
     );
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    let check_updates_label = format!("{} (v{})", tr.check_updates, env!("CARGO_PKG_VERSION"));
     AppendMenuW(
         menu,
         MF_STRING,
         CMD_CHECK_UPDATES,
-        keep(&mut labels, tr.check_updates),
+        keep(&mut labels, &check_updates_label),
     );
     AppendMenuW(
         menu,

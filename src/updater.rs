@@ -59,10 +59,22 @@ pub fn check_in_background(interactive: bool, on_exit_for_restart: fn()) {
                 prompt_and_apply(&info, on_exit_for_restart);
             }
             Ok(None) => {
-                diag::event("update", "up to date");
+                diag::event(
+                    "update",
+                    format!(
+                        "up to date (current=v{}, latest=v{})",
+                        env!("CARGO_PKG_VERSION"),
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                );
                 if interactive {
                     let tr = t();
-                    let _ = notify::show(tr.update_up_to_date_title, tr.update_up_to_date_body);
+                    let body = format!(
+                        "{} (v{})",
+                        tr.update_up_to_date_body,
+                        env!("CARGO_PKG_VERSION")
+                    );
+                    let _ = notify::show(tr.update_up_to_date_title, &body);
                 }
             }
             Err(e) => {
@@ -227,7 +239,7 @@ fn https_get(host: &str, path: &str) -> Result<Vec<u8>, String> {
             null(),
             null(),
             null(),
-            WINHTTP_FLAG_SECURE,
+            WINHTTP_FLAG_SECURE | WINHTTP_FLAG_REFRESH,
         );
         if request.is_null() {
             WinHttpCloseHandle(connect);
@@ -235,7 +247,7 @@ fn https_get(host: &str, path: &str) -> Result<Vec<u8>, String> {
             return Err("WinHttpOpenRequest failed".into());
         }
 
-        let headers = wide("Accept: application/vnd.github+json\r\n");
+        let headers = wide("Accept: application/vnd.github+json\r\nCache-Control: no-cache\r\n");
         let headers_len = headers.len().saturating_sub(1) as u32;
         let sent = WinHttpSendRequest(
             request,
