@@ -236,10 +236,11 @@ fn https_get(host: &str, path: &str) -> Result<Vec<u8>, String> {
         }
 
         let headers = wide("Accept: application/vnd.github+json\r\n");
+        let headers_len = headers.len().saturating_sub(1) as u32;
         let sent = WinHttpSendRequest(
             request,
             headers.as_ptr(),
-            u32::MAX,
+            headers_len,
             null(),
             0,
             0,
