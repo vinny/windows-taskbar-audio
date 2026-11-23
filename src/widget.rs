@@ -11,7 +11,7 @@ use crate::{diag, init_com, mixer, notify, render, settings, updater, wide};
 use std::cell::RefCell;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -50,6 +50,7 @@ const POLL_AUDIO: Duration = Duration::from_secs(2);
 
 static SNAPSHOT: Mutex<Option<AudioSnapshot>> = Mutex::new(None);
 static WAKE: OnceLock<Sender<()>> = OnceLock::new();
+static INSTANCE_MUTEX: AtomicUsize = AtomicUsize::new(0);
 pub static DEMO: AtomicBool = AtomicBool::new(false);
 
 struct App {
@@ -83,8 +84,24 @@ fn with<R>(f: impl FnOnce(&mut App) -> R) -> R {
 pub fn run() {
     unsafe {
         let mutex_name = wide(r"Local\taskbar-audio");
-        CreateMutexW(null(), 0, mutex_name.as_ptr());
-        if GetLastError() == ERROR_ALREADY_EXISTS {
+        let is_restarting = std::env::args().any(|a| a == "--restarting");
+        let mut acquired = false;
+        let attempts = if is_restarting { 40 } else { 1 };
+        for _ in 0..attempts {
+            let h = CreateMutexW(null(), 0, mutex_name.as_ptr());
+            if GetLastError() != ERROR_ALREADY_EXISTS {
+                INSTANCE_MUTEX.store(h as usize, Ordering::SeqCst);
+                acquired = true;
+                break;
+            }
+            if !h.is_null() {
+                CloseHandle(h);
+            }
+            if is_restarting {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        if !acquired {
             init_com();
             let tr = t();
             let _ = notify::show(tr.already_running_title, tr.already_running_body);
@@ -635,7 +652,17 @@ unsafe fn show_menu(hwnd: HWND) {
     }
 }
 
+pub fn release_instance_mutex() {
+    let h = INSTANCE_MUTEX.swap(0, Ordering::SeqCst);
+    if h != 0 {
+        unsafe {
+            CloseHandle(h as HANDLE);
+        }
+    }
+}
+
 fn request_exit() {
+    release_instance_mutex();
     let controller = with(|a| a.controller);
     if !controller.is_null() {
         unsafe { PostMessageW(controller, WM_APP_EXIT, 0, 0) };

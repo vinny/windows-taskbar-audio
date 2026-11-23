@@ -117,8 +117,13 @@ fn prompt_and_apply(info: &UpdateInfo, on_exit_for_restart: fn()) {
             match download_and_replace(asset_url) {
                 Ok(()) => {
                     let _ = notify::show(tr.update_installed_title, tr.update_installed_body);
+                    // Release the single-instance mutex before spawning the new binary so it never
+                    // sees ERROR_ALREADY_EXISTS while the old process finishes shutting down.
+                    crate::widget::release_instance_mutex();
                     if let Ok(exe) = std::env::current_exe() {
-                        let _ = std::process::Command::new(exe).spawn();
+                        let _ = std::process::Command::new(exe)
+                            .arg("--restarting")
+                            .spawn();
                         on_exit_for_restart();
                     }
                 }
