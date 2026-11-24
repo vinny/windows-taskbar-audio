@@ -1,6 +1,11 @@
-# windows-taskbar-audio
+# Windows Taskbar Audio
+
+[![CI](https://github.com/vinny/windows-taskbar-audio/actions/workflows/ci.yml/badge.svg)](https://github.com/vinny/windows-taskbar-audio/actions/workflows/ci.yml)
+[![Release](https://github.com/vinny/windows-taskbar-audio/actions/workflows/release.yml/badge.svg)](https://github.com/vinny/windows-taskbar-audio/actions/workflows/release.yml)
 
 **See your master volume, active output device, and a fast per-app volume mixer right on the Windows 11 taskbar.** No more digging through three layers of Windows Quick Settings just to turn down a loud browser tab or switch from your headset to your speakers.
+
+![taskbar-audio widget on the Windows 11 taskbar](docs/taskbar.png)
 
 - **Always visible:** sits on the taskbar just left of the system tray, showing an icon for your active output (headset, headphones, speakers, HDMI monitor), the current volume percentage, and optionally a short device name.
 - **Fast controls where you need them:**
@@ -8,10 +13,13 @@
   - **Left-click** opens a lightweight per-app mixer with individual sliders, mute buttons, and live audio peak meters for every open app.
   - **Middle-click** mutes or unmutes master volume immediately.
   - **Right-click** lists all connected output devices so you can switch your default audio output in one click.
-- **Call / communication indicator:** when you join a voice call (Discord, Teams, Zoom, Meet, Slack, or anything using your microphone), the widget changes color and shows a mic icon so you can tell at a glance that communication audio is active.
-- **Lightweight:** a single ~485 KB Rust executable. It uses under 1 MB of RAM in Task Manager, needs no installer or runtime DLLs (not even the Visual C++ Redistributable), and hands idle memory pages back to Windows between checks.
+- **Call / communication indicator:** when you join a voice call (Discord, Teams, Zoom, Meet, Slack, or anything using your microphone), the widget shows a green mic icon so you can tell at a glance that communication audio is active.
+- **Lightweight:** a single ~500 KB Rust executable. It uses under 1 MB of RAM in Task Manager, needs no installer or runtime DLLs (not even the Visual C++ Redistributable), and hands idle memory pages back to Windows between checks.
 - **Multi-language:** automatically follows your Windows display language (English, Portuguese, Spanish, French, and German) or lets you pick one from the right-click menu.
 - **Built-in updater:** checks GitHub Releases for new versions and can replace and restart itself in place.
+
+> [!NOTE]
+> This project was built with the help of Gemini 4 Argon.
 
 ---
 
@@ -23,7 +31,7 @@
    %LOCALAPPDATA%\Programs\taskbar-audio\
    ```
    It registers itself to start with Windows from wherever you run it, so don't launch it straight from your `Downloads` folder.
-3. Double-click it. Your volume and active device appear on the taskbar, just left of the system tray. (If you also run `taskbar-battery`, it automatically places itself right next to it without overlapping.)
+3. Double-click it. Your volume and active device appear on the taskbar, just left of the system tray.
 
 > **Windows SmartScreen prompt?** Because the binary isn't signed with a paid certificate, Windows may show *"Windows protected your PC"* on first launch. Click **More info → Run anyway**, or [build it from source](#build-from-source) yourself.
 
@@ -44,6 +52,8 @@ Want a more compact look (`🎧 74%` without the device name)? Right-click the w
 **Hover** over the widget to see the full output device name, which app is currently in a call, and the volume levels of your active applications.
 
 ### Quick app mixer (left-click)
+
+![taskbar-audio quick per-app volume mixer flyout](docs/open_taskbar.png)
 
 Left-click the widget to pop open the mixer right above the taskbar:
 
@@ -129,6 +139,16 @@ assets/
 └── icon.svg      vector application icon (rasterized at compile time by build.rs)
 build.rs          renders icon.svg and embeds the icon, version info, and PerMonitorV2 manifest
 ```
+
+---
+
+## Contributing
+
+Contributions are welcome! Whether you ran into a bug, have an idea for an improvement, or want to see `taskbar-audio` in your language:
+
+- **Bugs & feature requests:** [open an issue](../../issues) and attach the output of right-click → **Copy diagnostics** if something isn't behaving right.
+- **Pull requests:** feel free to open a PR for bug fixes, improvements, or new features. Please run `cargo clippy --all-targets -- -D warnings` and `cargo test` before submitting.
+- **Translations:** want another language added? You can request it in an issue or add it directly to `src/i18n.rs` and send a PR.
 
 ---
 
