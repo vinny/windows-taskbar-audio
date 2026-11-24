@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::null;
 use std::sync::atomic::{AtomicU32, Ordering};
-use windows::core::{IUnknown_Vtbl, Interface, GUID, HRESULT, PCWSTR};
+use windows::core::{IUnknown, IUnknown_Vtbl, Interface, GUID, HRESULT, PCWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{E_NOINTERFACE, E_POINTER, S_OK};
 use windows::Win32::Media::Audio::Endpoints::{
@@ -771,26 +771,19 @@ fn for_each_matching_session(session_key: &str, mut f: impl FnMut(&ISimpleAudioV
     }
 }
 
-/// Switches the default Windows audio output endpoint across Console, Multimedia, and Communications roles
+/// Switches the default Windows audio output or input endpoint across Console, Multimedia, and Communications roles
 /// using the undocumented `IPolicyConfig` COM interface (supported on Windows 7, 10, and 11).
 pub fn set_default_output_device(endpoint_id: &str) -> bool {
-    // CLSID_PolicyConfigClient: {870af99c-171d-4f9e-af0d-e63df40c2bc9}
     const CLSID_POLICY_CONFIG_CLIENT: GUID =
         GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
-    // IID_IPolicyConfig (Windows 10/11): {f8679f50-850a-41cf-9c72-430f290290c8}
-    const IID_IPOLICY_CONFIG_WIN10: GUID =
-        GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);
-    // IID_IPolicyConfigVista: {568b9108-44bf-40b4-9006-86afe5b5a620}
-    const IID_IPOLICY_CONFIG_VISTA: GUID =
-        GUID::from_u128(0x568b9108_44bf_40b4_9006_86afe5b5a620);
+
+    #[repr(transparent)]
+    #[derive(Clone)]
+    struct IPolicyConfig(IUnknown);
 
     #[repr(C)]
-    struct IPolicyConfigVtbl {
-        // IUnknown (3 methods)
-        query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
-        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
-        release: unsafe extern "system" fn(*mut c_void) -> u32,
-        // IPolicyConfig methods 0..9 before SetDefaultEndpoint (index 13 in vtable total)
+    struct IPolicyConfig_Vtbl {
+        base__: IUnknown_Vtbl,
         get_mix_format: *const c_void,
         get_device_format: *const c_void,
         reset_device_format: *const c_void,
@@ -804,49 +797,28 @@ pub fn set_default_output_device(endpoint_id: &str) -> bool {
         set_default_endpoint: unsafe extern "system" fn(*mut c_void, PCWSTR, i32) -> HRESULT,
     }
 
-    #[repr(C)]
-    struct IPolicyConfigRaw {
-        vtbl: *const IPolicyConfigVtbl,
+    unsafe impl Interface for IPolicyConfig {
+        type Vtable = IPolicyConfig_Vtbl;
+        const IID: GUID = GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);
     }
 
     unsafe {
-        let mut raw_ptr: *mut c_void = std::ptr::null_mut();
-        for iid in [IID_IPOLICY_CONFIG_WIN10, IID_IPOLICY_CONFIG_VISTA] {
-            if co_create_raw(&CLSID_POLICY_CONFIG_CLIENT, &iid, &mut raw_ptr) && !raw_ptr.is_null()
-            {
-                break;
-            }
-        }
-        if raw_ptr.is_null() {
+        let Ok(policy): Result<IPolicyConfig, _> =
+            CoCreateInstance(&CLSID_POLICY_CONFIG_CLIENT, None, CLSCTX_ALL)
+        else {
             return false;
-        }
-
-        let obj = raw_ptr as *mut IPolicyConfigRaw;
+        };
         let id_w = wide(endpoint_id);
         let pcw = PCWSTR(id_w.as_ptr());
 
         // eConsole = 0, eMultimedia = 1, eCommunications = 2
-        let hr0 = ((*(*obj).vtbl).set_default_endpoint)(raw_ptr, pcw, 0);
-        let _ = ((*(*obj).vtbl).set_default_endpoint)(raw_ptr, pcw, 1);
-        let _ = ((*(*obj).vtbl).set_default_endpoint)(raw_ptr, pcw, 2);
-        ((*(*obj).vtbl).release)(raw_ptr);
-
+        let vtbl = Interface::vtable(&policy);
+        let raw = Interface::as_raw(&policy);
+        let hr0 = (vtbl.set_default_endpoint)(raw, pcw, 0);
+        let _ = (vtbl.set_default_endpoint)(raw, pcw, 1);
+        let _ = (vtbl.set_default_endpoint)(raw, pcw, 2);
         hr0.is_ok()
     }
-}
-
-unsafe fn co_create_raw(clsid: *const GUID, iid: *const GUID, out: *mut *mut c_void) -> bool {
-    #[link(name = "ole32")]
-    extern "system" {
-        fn CoCreateInstance(
-            rclsid: *const GUID,
-            pUnkOuter: *mut c_void,
-            dwClsContext: u32,
-            riid: *const GUID,
-            ppv: *mut *mut c_void,
-        ) -> HRESULT;
-    }
-    CoCreateInstance(clsid, std::ptr::null_mut(), CLSCTX_ALL.0, iid, out).is_ok()
 }
 
 unsafe fn device_id(dev: &IMMDevice) -> Option<String> {
@@ -1031,7 +1003,11 @@ unsafe extern "system" fn vol_qi(
     if ppv.is_null() {
         return E_POINTER;
     }
-    if *riid == IID_IUNKNOWN || *riid == IAudioEndpointVolumeCallback::IID {
+    let Some(iid) = riid.as_ref() else {
+        *ppv = std::ptr::null_mut();
+        return E_POINTER;
+    };
+    if *iid == IID_IUNKNOWN || *iid == IAudioEndpointVolumeCallback::IID {
         *ppv = this;
         vol_add_ref(this);
         S_OK
@@ -1042,12 +1018,16 @@ unsafe extern "system" fn vol_qi(
 }
 
 unsafe extern "system" fn vol_add_ref(this: *mut c_void) -> u32 {
-    let obj = &*(this as *const RawVolumeNotify);
+    let Some(obj) = (this as *const RawVolumeNotify).as_ref() else {
+        return 0;
+    };
     obj.ref_count.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 unsafe extern "system" fn vol_release(this: *mut c_void) -> u32 {
-    let obj = &*(this as *const RawVolumeNotify);
+    let Some(obj) = (this as *const RawVolumeNotify).as_ref() else {
+        return 0;
+    };
     let prev = obj.ref_count.fetch_sub(1, Ordering::Release);
     if prev == 1 {
         std::sync::atomic::fence(Ordering::Acquire);
@@ -1060,8 +1040,9 @@ unsafe extern "system" fn vol_on_notify(
     this: *mut c_void,
     _pnotify: *mut AUDIO_VOLUME_NOTIFICATION_DATA,
 ) -> HRESULT {
-    let obj = &*(this as *const RawVolumeNotify);
-    (obj.on_change)();
+    if let Some(obj) = (this as *const RawVolumeNotify).as_ref() {
+        (obj.on_change)();
+    }
     S_OK
 }
 
@@ -1102,7 +1083,11 @@ unsafe extern "system" fn dev_qi(
     if ppv.is_null() {
         return E_POINTER;
     }
-    if *riid == IID_IUNKNOWN || *riid == IMMNotificationClient::IID {
+    let Some(iid) = riid.as_ref() else {
+        *ppv = std::ptr::null_mut();
+        return E_POINTER;
+    };
+    if *iid == IID_IUNKNOWN || *iid == IMMNotificationClient::IID {
         *ppv = this;
         dev_add_ref(this);
         S_OK
@@ -1113,12 +1098,16 @@ unsafe extern "system" fn dev_qi(
 }
 
 unsafe extern "system" fn dev_add_ref(this: *mut c_void) -> u32 {
-    let obj = &*(this as *const RawDeviceNotify);
+    let Some(obj) = (this as *const RawDeviceNotify).as_ref() else {
+        return 0;
+    };
     obj.ref_count.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 unsafe extern "system" fn dev_release(this: *mut c_void) -> u32 {
-    let obj = &*(this as *const RawDeviceNotify);
+    let Some(obj) = (this as *const RawDeviceNotify).as_ref() else {
+        return 0;
+    };
     let prev = obj.ref_count.fetch_sub(1, Ordering::Release);
     if prev == 1 {
         std::sync::atomic::fence(Ordering::Acquire);
@@ -1132,20 +1121,23 @@ unsafe extern "system" fn dev_state_changed(
     _pwstrdeviceid: PCWSTR,
     _dwnewstate: DEVICE_STATE,
 ) -> HRESULT {
-    let obj = &*(this as *const RawDeviceNotify);
-    (obj.on_change)();
+    if let Some(obj) = (this as *const RawDeviceNotify).as_ref() {
+        (obj.on_change)();
+    }
     S_OK
 }
 
 unsafe extern "system" fn dev_added(this: *mut c_void, _pwstrdeviceid: PCWSTR) -> HRESULT {
-    let obj = &*(this as *const RawDeviceNotify);
-    (obj.on_change)();
+    if let Some(obj) = (this as *const RawDeviceNotify).as_ref() {
+        (obj.on_change)();
+    }
     S_OK
 }
 
 unsafe extern "system" fn dev_removed(this: *mut c_void, _pwstrdeviceid: PCWSTR) -> HRESULT {
-    let obj = &*(this as *const RawDeviceNotify);
-    (obj.on_change)();
+    if let Some(obj) = (this as *const RawDeviceNotify).as_ref() {
+        (obj.on_change)();
+    }
     S_OK
 }
 
@@ -1155,8 +1147,9 @@ unsafe extern "system" fn dev_default_changed(
     _role: ERole,
     _pwstrdefaultdeviceid: PCWSTR,
 ) -> HRESULT {
-    let obj = &*(this as *const RawDeviceNotify);
-    (obj.on_change)();
+    if let Some(obj) = (this as *const RawDeviceNotify).as_ref() {
+        (obj.on_change)();
+    }
     S_OK
 }
 
