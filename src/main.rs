@@ -101,6 +101,11 @@ fn main() {
                         let mark = if o.is_default { "*" } else { " " };
                         println!("  {mark} {:<12} {}", format!("{:?}", o.kind), o.name);
                     }
+                    println!("\nAvailable Microphones ({}):", snap.inputs.len());
+                    for m in &snap.inputs {
+                        let mark = if m.is_default { "*" } else { " " };
+                        println!("  {mark} {}", m.name);
+                    }
                     println!("\nActive App Sessions ({}):", snap.sessions.len());
                     for s in &snap.sessions {
                         println!(

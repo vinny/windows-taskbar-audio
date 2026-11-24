@@ -1,0 +1,21 @@
+name: Feature request or translation
+description: Suggest an improvement or request a new language
+title: ""
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Type
+      options:
+        - Feature / improvement
+        - New language translation
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: Describe what you'd like to see or which language you'd like added.
+    validations:
+      required: true

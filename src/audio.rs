@@ -10,9 +10,14 @@ use crate::wide;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::null;
-use windows::core::{GUID, HRESULT, PCWSTR};
+use std::sync::atomic::{AtomicU32, Ordering};
+use windows::core::{IUnknown_Vtbl, Interface, GUID, HRESULT, PCWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use windows::Win32::Media::Audio::Endpoints::{IAudioEndpointVolume, IAudioMeterInformation};
+use windows::Win32::Foundation::{E_NOINTERFACE, E_POINTER, S_OK};
+use windows::Win32::Media::Audio::Endpoints::{
+    IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Vtbl,
+    IAudioMeterInformation,
+};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::StructuredStorage::{
     PropVariantToStringAlloc, PropVariantToUInt32,
@@ -188,9 +193,17 @@ pub struct OutputDevice {
 }
 
 #[derive(Clone, Debug)]
+pub struct InputDevice {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct AppSession {
     pub key: String,
     pub name: String,
+    pub exe_path: Option<String>,
     pub volume: u8,
     pub muted: bool,
     pub peak: f32,
@@ -207,6 +220,7 @@ pub struct AudioSnapshot {
     pub device_short_name: String,
     pub device_kind: DeviceKind,
     pub outputs: Vec<OutputDevice>,
+    pub inputs: Vec<InputDevice>,
     pub sessions: Vec<AppSession>,
     /// True when a communication app (Discord, Teams, Zoom, Meet, Slack, etc.) is actively streaming
     /// or an application is actively capturing from the microphone.
@@ -224,6 +238,7 @@ impl Default for AudioSnapshot {
             device_short_name: String::from("Audio"),
             device_kind: DeviceKind::Speakers,
             outputs: Vec::new(),
+            inputs: Vec::new(),
             sessions: Vec::new(),
             in_communication: false,
             comm_app_name: None,
@@ -261,10 +276,23 @@ pub fn demo_snapshot() -> AudioSnapshot {
                 is_default: false,
             },
         ],
+        inputs: vec![
+            InputDevice {
+                id: "demo-mic-1".into(),
+                name: "Microphone (PRO X Wireless Gaming Headset)".into(),
+                is_default: true,
+            },
+            InputDevice {
+                id: "demo-mic-2".into(),
+                name: "Microphone Array (Realtek(R) Audio)".into(),
+                is_default: false,
+            },
+        ],
         sessions: vec![
             AppSession {
                 key: "discord".into(),
                 name: "Discord".into(),
+                exe_path: None,
                 volume: 100,
                 muted: false,
                 peak: 0.42,
@@ -275,6 +303,7 @@ pub fn demo_snapshot() -> AudioSnapshot {
             AppSession {
                 key: "spotify".into(),
                 name: "Spotify".into(),
+                exe_path: None,
                 volume: 65,
                 muted: false,
                 peak: 0.68,
@@ -285,6 +314,7 @@ pub fn demo_snapshot() -> AudioSnapshot {
             AppSession {
                 key: "chrome".into(),
                 name: "Google Chrome".into(),
+                exe_path: None,
                 volume: 80,
                 muted: false,
                 peak: 0.0,
@@ -295,6 +325,7 @@ pub fn demo_snapshot() -> AudioSnapshot {
             AppSession {
                 key: "sys".into(),
                 name: t().mixer_system_sounds.into(),
+                exe_path: None,
                 volume: 40,
                 muted: false,
                 peak: 0.0,
@@ -368,6 +399,29 @@ pub fn snapshot() -> Option<AudioSnapshot> {
             }
         }
 
+        // 3b. All active capture (microphone) endpoints
+        let default_mic_id = enumerator
+            .GetDefaultAudioEndpoint(eCapture, eConsole)
+            .ok()
+            .and_then(|d| device_id(&d))
+            .unwrap_or_default();
+        let mut inputs = Vec::new();
+        if let Ok(coll) = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) {
+            let count = coll.GetCount().unwrap_or(0);
+            for i in 0..count {
+                if let Ok(dev) = coll.Item(i) {
+                    let id = device_id(&dev).unwrap_or_default();
+                    let (name, _) = device_name_and_kind(&dev);
+                    let is_default = id == default_mic_id;
+                    inputs.push(InputDevice {
+                        id,
+                        name,
+                        is_default,
+                    });
+                }
+            }
+        }
+
         // 4. Per-app audio sessions on the default playback device
         let mut sessions = read_render_sessions(&default_dev);
 
@@ -419,6 +473,7 @@ pub fn snapshot() -> Option<AudioSnapshot> {
             device_short_name: default_short,
             device_kind: default_kind,
             outputs,
+            inputs,
             sessions,
             in_communication,
             comm_app_name,
@@ -461,21 +516,21 @@ unsafe fn read_render_sessions(device: &IMMDevice) -> Vec<AppSession> {
                 .as_deref()
                 .is_some_and(|d| d.contains("AudioSrv.Dll"));
 
-        let (proc_name, exe_stem) = if is_system_sounds || pid == 0 {
-            (t().mixer_system_sounds.to_string(), String::from("system"))
+        let (proc_name, exe_stem, exe_path) = if is_system_sounds || pid == 0 {
+            (t().mixer_system_sounds.to_string(), String::from("system"), None)
         } else {
             match process_display_name(pid) {
-                Some((_, stem)) if stem == "svchost" || stem == "audiodg" => {
-                    (t().mixer_system_sounds.to_string(), String::from("system"))
+                Some((_, stem, _)) if stem == "svchost" || stem == "audiodg" => {
+                    (t().mixer_system_sounds.to_string(), String::from("system"), None)
                 }
-                Some((pretty, stem)) => (pretty, stem),
+                Some((pretty, stem, path)) => (pretty, stem, Some(path)),
                 None => {
                     // Process already exited; skip ghost session
                     if display_name.is_none() {
                         continue;
                     }
                     let dn = display_name.clone().unwrap_or_default();
-                    (dn.clone(), dn.to_ascii_lowercase())
+                    (dn.clone(), dn.to_ascii_lowercase(), None)
                 }
             }
         };
@@ -517,6 +572,9 @@ unsafe fn read_render_sessions(device: &IMMDevice) -> Vec<AppSession> {
             .and_modify(|existing| {
                 existing.is_active |= is_active;
                 existing.peak = existing.peak.max(peak);
+                if existing.exe_path.is_none() && exe_path.is_some() {
+                    existing.exe_path = exe_path.clone();
+                }
                 if is_active {
                     existing.volume = volume;
                     existing.muted = muted;
@@ -525,6 +583,7 @@ unsafe fn read_render_sessions(device: &IMMDevice) -> Vec<AppSession> {
             .or_insert(AppSession {
                 key,
                 name,
+                exe_path,
                 volume,
                 muted,
                 peak,
@@ -572,7 +631,7 @@ unsafe fn check_active_capture_sessions(enumerator: &IMMDeviceEnumerator) -> Opt
             if pid == 0 {
                 continue;
             }
-            if let Some((pretty, _)) = process_display_name(pid) {
+            if let Some((pretty, _, _)) = process_display_name(pid) {
                 return Some(pretty);
             }
         }
@@ -693,7 +752,7 @@ fn for_each_matching_session(session_key: &str, mut f: impl FnMut(&ISimpleAudioV
 
             let key = if is_sys || pid == 0 {
                 String::from("sys:0")
-            } else if let Some((_, stem)) = process_display_name(pid) {
+            } else if let Some((_, stem, _)) = process_display_name(pid) {
                 if stem == "svchost" || stem == "audiodg" {
                     String::from("sys:0")
                 } else {
@@ -829,7 +888,7 @@ unsafe fn pwstr_to_string(ptr: *mut u16) -> Option<String> {
     Some(s)
 }
 
-unsafe fn process_display_name(pid: u32) -> Option<(String, String)> {
+unsafe fn process_display_name(pid: u32) -> Option<(String, String, String)> {
     let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
     let mut buf = [0u16; 512];
     let mut size = buf.len() as u32;
@@ -852,7 +911,7 @@ unsafe fn process_display_name(pid: u32) -> Option<(String, String)> {
 
     for (k, friendly) in KNOWN_COMM_APPS {
         if stem_lower == *k {
-            return Some(((*friendly).to_string(), stem_lower));
+            return Some(((*friendly).to_string(), stem_lower, path));
         }
     }
 
@@ -868,7 +927,7 @@ unsafe fn process_display_name(pid: u32) -> Option<(String, String)> {
         "steamwebhelper" | "steam" => "Steam".to_string(),
         _ => capitalize_first(file_name),
     };
-    Some((friendly, stem_lower))
+    Some((friendly, stem_lower, path))
 }
 
 fn capitalize_first(s: &str) -> String {
@@ -877,6 +936,245 @@ fn capitalize_first(s: &str) -> String {
         None => String::new(),
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
     }
+}
+
+/// Zero-delay COM callback listener for volume/mute keys (`IAudioEndpointVolumeCallback`)
+/// and default endpoint / device plug-in changes (`IMMNotificationClient`).
+pub struct AudioEventWatcher {
+    enumerator: IMMDeviceEnumerator,
+    device_client: IMMNotificationClient,
+    bound_endpoint_id: String,
+    endpoint_vol: Option<IAudioEndpointVolume>,
+    vol_client: IAudioEndpointVolumeCallback,
+}
+
+impl AudioEventWatcher {
+    pub fn new(on_change: fn()) -> Option<Self> {
+        unsafe {
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER).ok()?;
+            let device_client = create_device_notify_client(on_change);
+            let _ = enumerator.RegisterEndpointNotificationCallback(&device_client);
+            let vol_client = create_volume_notify_client(on_change);
+
+            let mut watcher = Self {
+                enumerator,
+                device_client,
+                bound_endpoint_id: String::new(),
+                endpoint_vol: None,
+                vol_client,
+            };
+            watcher.rebind_default_endpoint();
+            Some(watcher)
+        }
+    }
+
+    /// Re-attaches `IAudioEndpointVolumeCallback` whenever the default playback device changes.
+    pub fn rebind_default_endpoint(&mut self) {
+        unsafe {
+            let Ok(dev) = self.enumerator.GetDefaultAudioEndpoint(eRender, eConsole) else {
+                return;
+            };
+            let id = device_id(&dev).unwrap_or_default();
+            if !id.is_empty() && id == self.bound_endpoint_id && self.endpoint_vol.is_some() {
+                return;
+            }
+            if let Some(old_vol) = self.endpoint_vol.take() {
+                let _ = old_vol.UnregisterControlChangeNotify(&self.vol_client);
+            }
+            if let Ok(ep_vol) = dev.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
+                if ep_vol.RegisterControlChangeNotify(&self.vol_client).is_ok() {
+                    self.bound_endpoint_id = id;
+                    self.endpoint_vol = Some(ep_vol);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for AudioEventWatcher {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(old_vol) = self.endpoint_vol.take() {
+                let _ = old_vol.UnregisterControlChangeNotify(&self.vol_client);
+            }
+            let _ = self
+                .enumerator
+                .UnregisterEndpointNotificationCallback(&self.device_client);
+        }
+    }
+}
+
+const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
+
+#[repr(C)]
+struct RawVolumeNotify {
+    vtbl: *const IAudioEndpointVolumeCallback_Vtbl,
+    ref_count: AtomicU32,
+    on_change: fn(),
+}
+
+static VOLUME_NOTIFY_VTBL: IAudioEndpointVolumeCallback_Vtbl = IAudioEndpointVolumeCallback_Vtbl {
+    base__: IUnknown_Vtbl {
+        QueryInterface: vol_qi,
+        AddRef: vol_add_ref,
+        Release: vol_release,
+    },
+    OnNotify: vol_on_notify,
+};
+
+unsafe extern "system" fn vol_qi(
+    this: *mut c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    if ppv.is_null() {
+        return E_POINTER;
+    }
+    if *riid == IID_IUNKNOWN || *riid == IAudioEndpointVolumeCallback::IID {
+        *ppv = this;
+        vol_add_ref(this);
+        S_OK
+    } else {
+        *ppv = std::ptr::null_mut();
+        E_NOINTERFACE
+    }
+}
+
+unsafe extern "system" fn vol_add_ref(this: *mut c_void) -> u32 {
+    let obj = &*(this as *const RawVolumeNotify);
+    obj.ref_count.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn vol_release(this: *mut c_void) -> u32 {
+    let obj = &*(this as *const RawVolumeNotify);
+    let prev = obj.ref_count.fetch_sub(1, Ordering::Release);
+    if prev == 1 {
+        std::sync::atomic::fence(Ordering::Acquire);
+        drop(Box::from_raw(this as *mut RawVolumeNotify));
+    }
+    prev - 1
+}
+
+unsafe extern "system" fn vol_on_notify(
+    this: *mut c_void,
+    _pnotify: *mut AUDIO_VOLUME_NOTIFICATION_DATA,
+) -> HRESULT {
+    let obj = &*(this as *const RawVolumeNotify);
+    (obj.on_change)();
+    S_OK
+}
+
+unsafe fn create_volume_notify_client(on_change: fn()) -> IAudioEndpointVolumeCallback {
+    let raw = Box::into_raw(Box::new(RawVolumeNotify {
+        vtbl: &VOLUME_NOTIFY_VTBL,
+        ref_count: AtomicU32::new(1),
+        on_change,
+    }));
+    IAudioEndpointVolumeCallback::from_raw(raw as *mut c_void)
+}
+
+#[repr(C)]
+struct RawDeviceNotify {
+    vtbl: *const IMMNotificationClient_Vtbl,
+    ref_count: AtomicU32,
+    on_change: fn(),
+}
+
+static DEVICE_NOTIFY_VTBL: IMMNotificationClient_Vtbl = IMMNotificationClient_Vtbl {
+    base__: IUnknown_Vtbl {
+        QueryInterface: dev_qi,
+        AddRef: dev_add_ref,
+        Release: dev_release,
+    },
+    OnDeviceStateChanged: dev_state_changed,
+    OnDeviceAdded: dev_added,
+    OnDeviceRemoved: dev_removed,
+    OnDefaultDeviceChanged: dev_default_changed,
+    OnPropertyValueChanged: dev_prop_changed,
+};
+
+unsafe extern "system" fn dev_qi(
+    this: *mut c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    if ppv.is_null() {
+        return E_POINTER;
+    }
+    if *riid == IID_IUNKNOWN || *riid == IMMNotificationClient::IID {
+        *ppv = this;
+        dev_add_ref(this);
+        S_OK
+    } else {
+        *ppv = std::ptr::null_mut();
+        E_NOINTERFACE
+    }
+}
+
+unsafe extern "system" fn dev_add_ref(this: *mut c_void) -> u32 {
+    let obj = &*(this as *const RawDeviceNotify);
+    obj.ref_count.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+unsafe extern "system" fn dev_release(this: *mut c_void) -> u32 {
+    let obj = &*(this as *const RawDeviceNotify);
+    let prev = obj.ref_count.fetch_sub(1, Ordering::Release);
+    if prev == 1 {
+        std::sync::atomic::fence(Ordering::Acquire);
+        drop(Box::from_raw(this as *mut RawDeviceNotify));
+    }
+    prev - 1
+}
+
+unsafe extern "system" fn dev_state_changed(
+    this: *mut c_void,
+    _pwstrdeviceid: PCWSTR,
+    _dwnewstate: DEVICE_STATE,
+) -> HRESULT {
+    let obj = &*(this as *const RawDeviceNotify);
+    (obj.on_change)();
+    S_OK
+}
+
+unsafe extern "system" fn dev_added(this: *mut c_void, _pwstrdeviceid: PCWSTR) -> HRESULT {
+    let obj = &*(this as *const RawDeviceNotify);
+    (obj.on_change)();
+    S_OK
+}
+
+unsafe extern "system" fn dev_removed(this: *mut c_void, _pwstrdeviceid: PCWSTR) -> HRESULT {
+    let obj = &*(this as *const RawDeviceNotify);
+    (obj.on_change)();
+    S_OK
+}
+
+unsafe extern "system" fn dev_default_changed(
+    this: *mut c_void,
+    _flow: EDataFlow,
+    _role: ERole,
+    _pwstrdefaultdeviceid: PCWSTR,
+) -> HRESULT {
+    let obj = &*(this as *const RawDeviceNotify);
+    (obj.on_change)();
+    S_OK
+}
+
+unsafe extern "system" fn dev_prop_changed(
+    _this: *mut c_void,
+    _pwstrdeviceid: PCWSTR,
+    _key: PROPERTYKEY,
+) -> HRESULT {
+    S_OK
+}
+
+unsafe fn create_device_notify_client(on_change: fn()) -> IMMNotificationClient {
+    let raw = Box::into_raw(Box::new(RawDeviceNotify {
+        vtbl: &DEVICE_NOTIFY_VTBL,
+        ref_count: AtomicU32::new(1),
+        on_change,
+    }));
+    IMMNotificationClient::from_raw(raw as *mut c_void)
 }
 
 #[cfg(test)]

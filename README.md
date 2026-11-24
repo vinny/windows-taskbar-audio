@@ -70,6 +70,7 @@ Right-click the widget for quick actions:
 - **Mute / Unmute master volume**
 - **Open app volume mixer**
 - **Output device list:** every connected playback device is listed with a checkmark on the current default. Click any device to switch Windows' default audio output (updates Console, Multimedia, and Communications roles at once).
+- **Input device (Microphone):** submenu listing your connected microphones so you can switch your default recording/voice input in one click.
 - **Language:** Automatic (follows Windows) or manual selection (English, Português, Español, Français, Deutsch).
 - **Show device name on taskbar:** toggle the short device label next to the percentage.
 - **Start with Windows:** enabled by default, and stays in sync with Windows' *Task Manager → Startup apps* toggle.

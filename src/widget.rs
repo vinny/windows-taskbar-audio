@@ -44,6 +44,7 @@ const CMD_EXIT: usize = 7;
 const CMD_LANG_AUTO: usize = 50;
 const CMD_LANG_BASE: usize = 51;
 const CMD_OUTPUT_BASE: usize = 100;
+const CMD_INPUT_BASE: usize = 300;
 
 const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
 const POLL_AUDIO: Duration = Duration::from_secs(2);
@@ -195,8 +196,12 @@ fn worker(controller: usize, rx: Receiver<()>) {
         return;
     }
     init_com();
+    let mut watcher = audio::AudioEventWatcher::new(wake);
 
     loop {
+        if let Some(w) = watcher.as_mut() {
+            w.rebind_default_endpoint();
+        }
         if let Some(snap) = audio::snapshot() {
             *SNAPSHOT.lock().unwrap() = Some(snap);
             unsafe { PostMessageW(controller as HWND, WM_APP_UPDATE, 0, 0) };
@@ -528,6 +533,38 @@ unsafe fn show_menu(hwnd: HWND) {
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
 
+    // 2b. Input devices (Microphone) submenu
+    let input_menu = CreatePopupMenu();
+    if snap.inputs.is_empty() {
+        AppendMenuW(
+            input_menu,
+            MF_STRING | MF_GRAYED,
+            0,
+            keep(&mut labels, tr.no_input_devices),
+        );
+    } else {
+        for (i, mic) in snap.inputs.iter().enumerate() {
+            let check = if mic.is_default {
+                MF_CHECKED
+            } else {
+                MF_UNCHECKED
+            };
+            AppendMenuW(
+                input_menu,
+                MF_STRING | check,
+                CMD_INPUT_BASE + i,
+                keep(&mut labels, &mic.name),
+            );
+        }
+    }
+    AppendMenuW(
+        menu,
+        MF_POPUP,
+        input_menu as usize,
+        keep(&mut labels, tr.input_devices_menu),
+    );
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+
     // 3. Language submenu
     let lang_menu = CreatePopupMenu();
     let current_override = settings::language_override();
@@ -640,10 +677,18 @@ unsafe fn show_menu(hwnd: HWND) {
             settings::set_language_override(Some(lang));
             redraw();
         }
-        c if c >= CMD_OUTPUT_BASE => {
+        c if (CMD_OUTPUT_BASE..CMD_INPUT_BASE).contains(&c) => {
             if let Some(dev) = snap.outputs.get(c - CMD_OUTPUT_BASE) {
                 if audio::set_default_output_device(&dev.id) {
                     diag::event("switch_output", format!("switched to {}", dev.short_name));
+                }
+                wake();
+            }
+        }
+        c if c >= CMD_INPUT_BASE => {
+            if let Some(mic) = snap.inputs.get(c - CMD_INPUT_BASE) {
+                if audio::set_default_output_device(&mic.id) {
+                    diag::event("switch_input", format!("switched mic to {}", mic.name));
                 }
                 wake();
             }

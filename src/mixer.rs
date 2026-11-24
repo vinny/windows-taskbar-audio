@@ -11,6 +11,7 @@ use crate::i18n::t;
 use crate::render::device_icon;
 use crate::wide;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
@@ -22,6 +23,7 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows_sys::Win32::UI::Shell::ExtractIconExW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const FLYOUT_CLASS: &str = "TaskbarAudioMixerFlyout";
@@ -49,6 +51,7 @@ struct FlyoutState {
     rows: Vec<HitRow>,
     dragging: Option<Target>,
     on_change: Option<fn()>,
+    icon_cache: HashMap<String, HICON>,
 }
 
 thread_local! {
@@ -60,6 +63,7 @@ thread_local! {
         rows: Vec::new(),
         dragging: None,
         on_change: None,
+        icon_cache: HashMap::new(),
     });
 }
 
@@ -612,6 +616,7 @@ unsafe fn paint_flyout(hwnd: HWND, target_dc: HDC) {
             &s,
             w,
             tr.mixer_master_label,
+            null_mut(),
             snap.master_volume,
             snap.master_muted,
             0.0,
@@ -670,11 +675,17 @@ unsafe fn paint_flyout(hwnd: HWND, target_dc: HDC) {
     } else {
         for (idx, app) in snap.sessions.iter().enumerate() {
             if let Some(hit_row) = rows.get(idx + 1) {
+                let app_icon = app
+                    .exe_path
+                    .as_deref()
+                    .map(|p| get_cached_app_icon(p))
+                    .unwrap_or(null_mut());
                 draw_slider_row(
                     dc,
                     &s,
                     w,
                     &app.name,
+                    app_icon,
                     app.volume,
                     app.muted,
                     app.peak,
@@ -708,12 +719,27 @@ unsafe fn paint_flyout(hwnd: HWND, target_dc: HDC) {
     DeleteDC(dc);
 }
 
+unsafe fn get_cached_app_icon(exe_path: &str) -> HICON {
+    if let Some(cached) = with_state(|st| st.icon_cache.get(exe_path).copied()) {
+        return cached;
+    }
+    let path_w = wide(exe_path);
+    let mut small_icon: HICON = null_mut();
+    let count = ExtractIconExW(path_w.as_ptr(), 0, null_mut(), &mut small_icon, 1);
+    let hicon = if count > 0 { small_icon } else { null_mut() };
+    with_state(|st| {
+        st.icon_cache.insert(exe_path.to_string(), hicon);
+    });
+    hicon
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn draw_slider_row(
     dc: HDC,
     s: &dyn Fn(i32) -> i32,
     width: i32,
     title: &str,
+    app_icon: HICON,
     volume: u8,
     muted: bool,
     peak: f32,
@@ -729,6 +755,23 @@ unsafe fn draw_slider_row(
     muted_col: u32,
 ) {
     let pad_x = s(16);
+    let mut title_left = row.slider_rect.left;
+    if !app_icon.is_null() {
+        let icon_sz = s(16);
+        DrawIconEx(
+            dc,
+            title_left,
+            row.row_rect.top + s(3),
+            app_icon,
+            icon_sz,
+            icon_sz,
+            0,
+            null_mut(),
+            DI_NORMAL,
+        );
+        title_left += icon_sz + s(6);
+    }
+
     // Title above the slider
     SelectObject(dc, label_font);
     SetTextColor(dc, if muted { sub_col } else { fg_col });
@@ -738,7 +781,7 @@ unsafe fn draw_slider_row(
         title.to_string()
     };
     let mut title_rc = RECT {
-        left: row.slider_rect.left,
+        left: title_left,
         top: row.row_rect.top + s(2),
         right: width - pad_x - s(44),
         bottom: row.row_rect.top + s(22),

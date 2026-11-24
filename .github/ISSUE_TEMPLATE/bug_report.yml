@@ -1,0 +1,20 @@
+name: Bug report
+description: Something isn't working as expected
+title: ""
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the issue and how to reproduce it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Right-click the taskbar widget → **Copy diagnostics**, then paste here.
+      render: text
+    validations:
+      required: true
