@@ -1,5 +1,10 @@
-# Ignore compiled standalone binaries and local build artifacts
+# Ignore compiled standalone binaries, MSIX packages, staging dirs, and local build artifacts
 /target
+/dist
 /taskbar-audio.exe
+/taskbar-audio-*.exe
 /*.old.exe
 /*.new.exe
+/*.msix
+/*.msixbundle
+/packaging/msix/stage-*
