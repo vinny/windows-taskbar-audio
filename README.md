@@ -14,9 +14,9 @@
   - **Middle-click** mutes or unmutes master volume immediately.
   - **Right-click** lists all connected output devices so you can switch your default audio output in one click.
 - **Call / communication indicator:** when you join a voice call (Discord, Teams, Zoom, Meet, Slack, or anything using your microphone), the widget shows a green mic icon so you can tell at a glance that communication audio is active.
-- **Lightweight:** a single ~500 KB Rust executable. It uses under 1 MB of RAM in Task Manager, needs no installer or runtime DLLs (not even the Visual C++ Redistributable), and hands idle memory pages back to Windows between checks.
+- **Lightweight:** a single ~510 KB Rust executable (available for both **x64** and **ARM64**). It uses under 1 MB of RAM in Task Manager, needs no installer or runtime DLLs (not even the Visual C++ Redistributable), and updates instantly via Windows Core Audio callbacks.
 - **Multi-language:** automatically follows your Windows display language (English, Portuguese, Spanish, French, and German) or lets you pick one from the right-click menu.
-- **Built-in updater:** checks GitHub Releases for new versions and can replace and restart itself in place.
+- **Built-in updater:** checks GitHub Releases over TLS 1.2/1.3, verifies the downloaded binary against `SHA256SUMS.txt` using Windows CNG, and can replace and restart itself in place.
 
 > [!NOTE]
 > This project was built with the help of Gemini 4 Argon.
@@ -25,7 +25,7 @@
 
 ## Install
 
-1. Download **`taskbar-audio.exe`** from the [latest release](../../releases/latest).
+1. Download **`taskbar-audio.exe`** (or **`taskbar-audio-arm64.exe`** for Windows on ARM) from the [latest release](../../releases/latest).
 2. Put it in a permanent folder. A good spot is:
    ```
    %LOCALAPPDATA%\Programs\taskbar-audio\
@@ -58,9 +58,10 @@ Want a more compact look (`🎧 74%` without the device name)? Right-click the w
 Left-click the widget to pop open the mixer right above the taskbar:
 
 - **Master volume** at the top.
-- **Active apps** below: every program with an open audio session gets its own slider and mute button.
-- **Drag** a slider, **click** the speaker icon to mute a specific app, or simply **hover over any app row and roll your mouse wheel**.
+- **Active apps** below: every program with an open audio session gets its own icon, slider, and mute button.
+- **Mouse or keyboard:** drag a slider, click the speaker icon to mute a specific app, hover over any row and roll your mouse wheel, or use the keyboard (`Tab` / `↑` / `↓` to select a row, `←` / `→` to adjust volume, `Space` or `M` to mute, `Esc` to close).
 - A thin green meter under each slider shows live audio output levels in real time.
+- Respects multi-monitor setups and Windows High Contrast mode automatically.
 - Click anywhere outside (or press `Esc`) to close it.
 
 ### Right-click menu
@@ -83,10 +84,10 @@ Right-click the widget for quick actions:
 
 Windows 11 removed the legacy `IDeskBand` API that old taskbar toolbars used. `taskbar-audio` creates a small per-pixel transparent child window (`WS_CHILD` + `WS_EX_LAYERED`) attached directly to `Shell_TrayWnd` and positions it just left of `TrayNotifyWnd`.
 
-- **Core Audio (WASAPI):** reads and controls master volume, per-process audio sessions, and real-time peak meters straight through Windows' native COM interfaces (`IMMDeviceEnumerator`, `IAudioEndpointVolume`, `IAudioSessionManager2`, `ISimpleAudioVolume`, and `IAudioMeterInformation`).
-- **Instant output switching:** uses Windows' `IPolicyConfig` COM interface to switch the default playback endpoint across all audio roles without opening Settings.
+- **Core Audio (WASAPI):** reads and controls master volume, per-process audio sessions, and real-time peak meters straight through Windows' native COM interfaces (`IMMDeviceEnumerator`, `IAudioEndpointVolume`, `IAudioSessionManager2`, `ISimpleAudioVolume`, and `IAudioMeterInformation`), and subscribes to `IAudioEndpointVolumeCallback` and `IMMNotificationClient` so hardware media keys and device plug/unplug events reflect immediately.
+- **Instant output & mic switching:** uses Windows' `IPolicyConfig` COM interface to switch the default playback or recording endpoint across all audio roles without opening Settings.
 - **Explorer restarts:** listens for `TaskbarCreated` broadcasts so the widget is recreated automatically if `explorer.exe` restarts.
-- **Zero-dependency updater:** uses native `WinHTTP` to check GitHub Releases, download the new `.exe`, rename the running binary to `.old.exe`, and relaunch.
+- **Zero-dependency updater:** uses native `WinHTTP` (TLS 1.2/1.3) and Windows CNG (`bcrypt.dll`) to check GitHub Releases, verify the binary's SHA-256 checksum against `SHA256SUMS.txt`, rename the running binary to `.old.exe`, and relaunch cleanly.
 
 ---
 
@@ -120,6 +121,12 @@ cargo build --release            # -> target/release/taskbar-audio.exe
 ./build-clean.ps1 -CleanOnly     # deletes target/ and unpacked crate caches (~1.4 GB saved)
 ```
 
+For a **Microsoft Store (MSIX)** compliant build (uses the official system tray `Shell_NotifyIconW`, disables self-update, and relies on MSIX `StartupTask`):
+
+```sh
+cargo build --release --no-default-features --features store
+```
+
 Useful debug and CLI flags:
 
 ```sh
@@ -142,9 +149,12 @@ src/
 ├── updater.rs    GitHub Releases checker and in-place self-updater over WinHTTP
 ├── settings.rs   registry settings and Windows Startup apps integration
 ├── notify.rs     WinRT toast notifications
-└── diag.rs       local diagnostics log for troubleshooting
+├── diag.rs       local diagnostics log for troubleshooting
+└── win32_raii.rs RAII guards for COM, GDI, and WinHTTP handles
 assets/
 └── icon.svg      vector application icon (rasterized at compile time by build.rs)
+packaging/msix/
+└── AppxManifest.xml  MSIX package manifest for Microsoft Store builds
 build.rs          renders icon.svg and embeds the icon, version info, and PerMonitorV2 manifest
 ```
 
