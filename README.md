@@ -110,7 +110,14 @@ Requirements: [Rust](https://rustup.rs) (stable) and the Visual Studio C++ Build
 ```sh
 git clone https://github.com/vinny/windows-taskbar-audio
 cd windows-taskbar-audio
+./build-clean.ps1                # builds release exe, copies it to root, and wipes target/ + Cargo caches
+```
+
+Or if building manually with Cargo:
+
+```sh
 cargo build --release            # -> target/release/taskbar-audio.exe
+./build-clean.ps1 -CleanOnly     # deletes target/ and unpacked crate caches (~1.4 GB saved)
 ```
 
 Useful debug and CLI flags:

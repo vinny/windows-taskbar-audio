@@ -1,1 +1,5 @@
+# Ignore compiled standalone binaries and local build artifacts
 /target
+/taskbar-audio.exe
+/*.old.exe
+/*.new.exe
