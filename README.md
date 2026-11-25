@@ -25,6 +25,10 @@
 
 ## Install
 
+### Option 1: Microsoft Store
+Install directly from the [Microsoft Store](https://apps.microsoft.com/detail/9NRCF7XB49KG) (automatic updates and Microsoft-signed package).
+
+### Option 2: Standalone executable (GitHub)
 1. Download **`taskbar-audio.exe`** (or **`taskbar-audio-arm64.exe`** for Windows on ARM) from the [latest release](../../releases/latest).
 2. Put it in a permanent folder. A good spot is:
    ```

@@ -7,14 +7,14 @@
   IgnorableNamespaces="uap rescap desktop">
 
   <Identity
-    Name="Vinny.TaskbarAudio"
-    Publisher="CN=Vinny"
-    Version="0.1.0.0"
+    Name="VinnySantos.TaskbarAudio"
+    Publisher="CN=73B1EB55-0637-4699-9B59-496D26478B09"
+    Version="1.0.0.0"
     ProcessorArchitecture="x64" />
 
   <Properties>
     <DisplayName>Taskbar Audio</DisplayName>
-    <PublisherDisplayName>Vinny</PublisherDisplayName>
+    <PublisherDisplayName>Vinny Santos</PublisherDisplayName>
     <Logo>assets\StoreLogo.png</Logo>
   </Properties>
 

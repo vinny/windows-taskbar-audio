@@ -7,8 +7,9 @@
     .\packaging\msix\pack-msix.ps1 -IdentityName "12345Vinny.TaskbarAudio" -Publisher "CN=XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
 #>
 param(
-    [string]$IdentityName = "Vinny.TaskbarAudio",
-    [string]$Publisher = "CN=Vinny",
+    [string]$IdentityName = "VinnySantos.TaskbarAudio",
+    [string]$Publisher = "CN=73B1EB55-0637-4699-9B59-496D26478B09",
+    [string]$PublisherDisplayName = "Vinny Santos",
     [ValidateSet("x64", "arm64")]
     [string]$Arch = "x64",
     [string]$Version = ""
@@ -123,10 +124,11 @@ try {
 
     $manifest = Get-Content (Join-Path $repoRoot "packaging\msix\AppxManifest.xml") -Raw
     $manifest = $manifest `
-        -replace 'Name="[^"]+"', "Name=`"$IdentityName`"" `
-        -replace 'Publisher="[^"]+"', "Publisher=`"$Publisher`"" `
-        -replace 'Version="[^"]+"', "Version=`"$Version`"" `
-        -replace 'ProcessorArchitecture="[^"]+"', "ProcessorArchitecture=`"$Arch`""
+        -replace '(<Identity[\s\S]*?Name=")[^"]+(")', "`${1}$IdentityName`${2}" `
+        -replace '(<Identity[\s\S]*?Publisher=")[^"]+(")', "`${1}$Publisher`${2}" `
+        -replace '(<Identity[\s\S]*?Version=")[^"]+(")', "`${1}$Version`${2}" `
+        -replace '(<Identity[\s\S]*?ProcessorArchitecture=")[^"]+(")', "`${1}$Arch`${2}" `
+        -replace '(<PublisherDisplayName>)[^<]+(</PublisherDisplayName>)', "`${1}$PublisherDisplayName`${2}"
     Set-Content -Path (Join-Path $stageDir "AppxManifest.xml") -Value $manifest -Encoding utf8
 
     if (Test-Path $outMsix) { Remove-Item -Force $outMsix }
