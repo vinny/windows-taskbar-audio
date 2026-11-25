@@ -5,14 +5,22 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+fn build_manifest(version: &str) -> String {
+    let mut parts = version.split('.').map(|p| p.parse::<u16>().unwrap_or(0));
+    let (maj, min, pat) = (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    );
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
-  <assemblyIdentity type="win32" name="TaskbarAudio" version="1.0.0.0"/>
+  <assemblyIdentity type="win32" name="TaskbarAudio" version="{maj}.{min}.{pat}.0"/>
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
     <application>
-      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
-      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
-      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+      <supportedOS Id="{{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}}"/>
+      <supportedOS Id="{{1f676c76-80e1-4239-95bb-83d0f6d0da78}}"/>
+      <supportedOS Id="{{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}}"/>
     </application>
   </compatibility>
   <asmv3:application>
@@ -28,7 +36,9 @@ const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?
     </dependentAssembly>
   </dependency>
 </assembly>
-"#;
+"#
+    )
+}
 
 fn render_svg_png(tree: &resvg::usvg::Tree, size: u32) -> Vec<u8> {
     let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size).expect("pixmap allocation");
@@ -86,9 +96,11 @@ fn main() {
         .expect("failed to write generated icon-64.png");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let pkg_ver = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.1.0".into());
+        let manifest = build_manifest(&pkg_ver);
         let mut res = winresource::WindowsResource::new();
         res.set_icon(ico_path.to_str().expect("ico_path"))
-            .set_manifest(MANIFEST)
+            .set_manifest(&manifest)
             .set("FileDescription", "Taskbar Audio")
             .set("ProductName", "Taskbar Audio")
             .set("LegalCopyright", "© 2026 Vinny. MIT License.");

@@ -59,6 +59,7 @@ impl Lang {
     }
 }
 
+#[allow(dead_code)]
 pub struct Texts {
     pub already_running_title: &'static str,
     pub already_running_body: &'static str,
@@ -203,7 +204,7 @@ const EN: Texts = Texts {
 };
 
 const ES: Texts = Texts {
-    already_running_title: "Taskbar Audio ya está en execução",
+    already_running_title: "Taskbar Audio ya está en ejecución",
     already_running_body: "El control de volumen ya aparece en la barra de tareas, junto al reloj.",
     welcome_title: "Taskbar Audio está activo",
     welcome_body: "El volumen se muestra en la barra de tareas. Usa la rueda del ratón para ajustarlo, clic izquierdo para el mezclador o clic derecho para cambiar de salida.",

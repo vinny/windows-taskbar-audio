@@ -1,6 +1,6 @@
 [package]
 name = "taskbar-audio"
-version = "0.0.6"
+version = "0.1.0"
 edition = "2021"
 description = "Volume, active audio device, per-app mixer, and call indicator on the Windows taskbar"
 license = "MIT"
@@ -9,6 +9,17 @@ repository = "https://github.com/vinny/windows-taskbar-audio"
 [[bin]]
 name = "taskbar-audio"
 path = "src/main.rs"
+
+[features]
+# Standard standalone GitHub/WinGet distribution:
+# - self-update: built-in GitHub Releases updater with SHA-256 verification
+# - taskbar-inject: embeds widget directly into Shell_TrayWnd (Windows 11 taskbar)
+default = ["self-update", "taskbar-inject"]
+self-update = []
+taskbar-inject = []
+# Microsoft Store (MSIX) compliant profile:
+# disables self-update & taskbar injection, uses official Shell_NotifyIconW + StartupTask consent model
+store = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -29,12 +40,13 @@ windows = { version = "0.58", features = [
 ] }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Networking_WinHttp",
     "Win32_Security",
+    "Win32_Security_Cryptography",
     "Win32_System_DataExchange",
-    "Win32_Globalization",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Registry",

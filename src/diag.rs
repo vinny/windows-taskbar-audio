@@ -14,6 +14,7 @@ const MAX_LEN: u64 = 256 * 1024;
 const COPY_LEN: usize = 32 * 1024;
 
 static LAST: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+static FILE_IO_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn path() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA")
@@ -36,7 +37,7 @@ pub fn start() {
 pub fn event(key: &str, msg: impl Display) {
     let msg = msg.to_string();
     {
-        let mut last = LAST.lock().unwrap();
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         let last = last.get_or_insert_with(HashMap::new);
         if last.get(key) == Some(&msg) {
             return;
@@ -55,6 +56,7 @@ fn write(line: &str) {
         eprintln!("{line}");
     }
     let Some(path) = path() else { return };
+    let _guard = FILE_IO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if fs::metadata(&path).is_ok_and(|m| m.len() > MAX_LEN) {
         let _ = fs::rename(&path, path.with_extension("old.log"));
     }

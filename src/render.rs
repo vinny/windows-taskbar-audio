@@ -1,9 +1,11 @@
 //! Draws the taskbar widget into a per-pixel-alpha 32-bpp DIB and pushes it with `UpdateLayeredWindow`,
 //! so icons and text blend cleanly over the translucent Windows 11 taskbar.
+//! All GDI objects use RAII guards (`OwnedDc`, `OwnedGdi`, `SelectedObj`) so no HFONT or HBITMAP can leak.
 
 use crate::audio::{AudioSnapshot, DeviceKind};
 use crate::i18n::t;
 use crate::wide;
+use crate::win32_raii::{OwnedDc, OwnedGdi, SelectedObj};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
@@ -44,6 +46,48 @@ pub fn device_icon(kind: DeviceKind, volume: u8, muted: bool) -> &'static str {
     }
 }
 
+/// Captures every field that affects the taskbar bitmap so we skip redundant redraws when nothing changed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct BarVisualKey {
+    pub volume: u8,
+    pub muted: bool,
+    pub kind: DeviceKind,
+    pub short_name: String,
+    pub show_device_label: bool,
+    pub in_communication: bool,
+    pub dpi: u32,
+    pub layout: Layout,
+    pub light: bool,
+    pub muted_label: &'static str,
+}
+
+impl BarVisualKey {
+    pub fn from_state(
+        snap: &AudioSnapshot,
+        show_device_label: bool,
+        dpi: u32,
+        layout: Layout,
+        light: bool,
+    ) -> Self {
+        Self {
+            volume: snap.master_volume,
+            muted: snap.master_muted,
+            kind: snap.device_kind,
+            short_name: if show_device_label {
+                snap.device_short_name.clone()
+            } else {
+                String::new()
+            },
+            show_device_label,
+            in_communication: snap.in_communication,
+            dpi,
+            layout,
+            light,
+            muted_label: t().muted,
+        }
+    }
+}
+
 struct Seg {
     text: Vec<u16>,
     icon: bool,
@@ -75,7 +119,7 @@ pub unsafe fn draw(
     let muted_red = if light { 0xC42B1C } else { 0xFF6B6B };
     let comm_color = if light { 0x0F7B0F } else { 0x6CCB5F };
 
-    let mut segs = Vec::new();
+    let mut segs = Vec::with_capacity(4);
     let seg = |text: &str, icon: bool, color: u32, opacity: u32, gap_after: i32| Seg {
         text: wide(text),
         icon,
@@ -126,18 +170,28 @@ pub unsafe fn draw(
     }
 
     let screen = GetDC(null_mut());
-    let dc = CreateCompatibleDC(screen);
+    let dc = OwnedDc(CreateCompatibleDC(screen));
     ReleaseDC(null_mut(), screen);
-    let text_font = font("Segoe UI", -s(12), FW_NORMAL as i32);
-    let icon_font = font("Segoe Fluent Icons", -s(15), FW_NORMAL as i32);
+    if dc.0.is_null() {
+        return (0, 0);
+    }
 
-    // Measure segments
-    for item in &mut segs {
-        SelectObject(dc, if item.icon { icon_font } else { text_font });
-        let mut size: SIZE = zeroed();
-        GetTextExtentPoint32W(dc, item.text.as_ptr(), item.text.len() as i32 - 1, &mut size);
-        item.w = size.cx;
-        item.h = size.cy;
+    let text_font = OwnedGdi(font("Segoe UI", -s(12), FW_NORMAL as i32));
+    let icon_font = OwnedGdi(font("Segoe Fluent Icons", -s(15), FW_NORMAL as i32));
+
+    // Measure segments (restore original font when scope ends so DeleteObject always succeeds)
+    {
+        let _font_guard = SelectedObj::select(dc.0, text_font.0);
+        for item in &mut segs {
+            SelectObject(dc.0, if item.icon { icon_font.0 } else { text_font.0 });
+            let mut size: SIZE = zeroed();
+            let char_len = item.text.len().saturating_sub(1) as i32;
+            if char_len > 0 {
+                GetTextExtentPoint32W(dc.0, item.text.as_ptr(), char_len, &mut size);
+            }
+            item.w = size.cx;
+            item.h = size.cy;
+        }
     }
 
     let pad = s(7);
@@ -162,6 +216,10 @@ pub unsafe fn draw(
         }
     };
 
+    if width <= 0 || height <= 0 {
+        return (0, 0);
+    }
+
     let mut bi: BITMAPINFO = zeroed();
     bi.bmiHeader = BITMAPINFOHEADER {
         biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -173,50 +231,60 @@ pub unsafe fn draw(
         ..zeroed()
     };
     let mut bits: *mut c_void = null_mut();
-    let bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-    if bmp.is_null() || bits.is_null() {
-        DeleteObject(text_font);
-        DeleteObject(icon_font);
-        DeleteDC(dc);
+    let bmp = OwnedGdi(CreateDIBSection(
+        dc.0,
+        &bi,
+        DIB_RGB_COLORS,
+        &mut bits,
+        null_mut(),
+        0,
+    ));
+    if bmp.0.is_null() || bits.is_null() {
         return (width, height);
     }
-    let old_bmp = SelectObject(dc, bmp);
-    SetBkMode(dc, TRANSPARENT as _);
-    SetTextColor(dc, 0x00FF_FFFF);
-    for item in &segs {
-        SelectObject(dc, if item.icon { icon_font } else { text_font });
-        TextOutW(
-            dc,
-            item.x,
-            item.y,
-            item.text.as_ptr(),
-            item.text.len() as i32 - 1,
-        );
+
+    let _bmp_guard = SelectedObj::select(dc.0, bmp.0);
+    {
+        let _font_guard = SelectedObj::select(dc.0, text_font.0);
+        SetBkMode(dc.0, TRANSPARENT as _);
+        SetTextColor(dc.0, 0x00FF_FFFF);
+        for item in &segs {
+            let char_len = item.text.len().saturating_sub(1) as i32;
+            if char_len > 0 {
+                SelectObject(dc.0, if item.icon { icon_font.0 } else { text_font.0 });
+                TextOutW(dc.0, item.x, item.y, item.text.as_ptr(), char_len);
+            }
+        }
     }
     GdiFlush();
 
-    let mut paint = vec![(fg, 255u32); (width * height) as usize];
+    // Convert white-on-black grayscale coverage into premultiplied BGRA directly in place
+    // without allocating a temporary `width * height` color table.
+    let px = std::slice::from_raw_parts_mut(bits as *mut u32, (width * height) as usize);
+    // First pass: mark every pixel outside segments as clickable transparent (alpha = 1).
     for item in &segs {
         let (x0, x1) = (item.x.max(0), (item.x + item.w).min(width));
         let (y0, y1) = (item.y.max(0), (item.y + item.h).min(height));
         for y in y0..y1 {
+            let row = (y * width) as usize;
             for x in x0..x1 {
-                paint[(y * width + x) as usize] = (item.color, item.opacity);
+                let p = &mut px[row + x as usize];
+                let cov = ((*p >> 16) & 0xFF).max((*p >> 8) & 0xFF).max(*p & 0xFF);
+                let a = cov * item.opacity / 255;
+                *p = if a == 0 {
+                    0x0100_0000
+                } else {
+                    let ch = |shift: u32| ((item.color >> shift) & 0xFF) * a / 255;
+                    (a << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
+                };
             }
         }
     }
-    let px = std::slice::from_raw_parts_mut(bits as *mut u32, (width * height) as usize);
-    for (i, p) in px.iter_mut().enumerate() {
-        let (color, opacity) = paint[i];
-        let cov = ((*p >> 16) & 0xFF).max((*p >> 8) & 0xFF).max(*p & 0xFF);
-        let a = cov * opacity / 255;
-        // Alpha 1 keeps the whole bounding box clickable/scrollable while staying invisible
-        *p = if a == 0 {
-            0x0100_0000
-        } else {
-            let ch = |shift: u32| ((color >> shift) & 0xFF) * a / 255;
-            (a << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
-        };
+    // Any remaining untouched pixel (zero alpha) gets alpha = 1 so the entire bounding box is interactive.
+    for p in px.iter_mut() {
+        if (*p >> 24) == 0 {
+            *p = 0x0100_0000;
+        }
     }
 
     let size = SIZE { cx: width, cy: height };
@@ -232,18 +300,13 @@ pub unsafe fn draw(
         null_mut(),
         null(),
         &size,
-        dc,
+        dc.0,
         &origin,
         0,
         &blend,
         ULW_ALPHA,
     );
 
-    SelectObject(dc, old_bmp);
-    DeleteObject(bmp);
-    DeleteObject(text_font);
-    DeleteObject(icon_font);
-    DeleteDC(dc);
     (width, height)
 }
 

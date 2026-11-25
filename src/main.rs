@@ -9,19 +9,10 @@ mod render;
 mod settings;
 mod updater;
 mod widget;
+mod win32_raii;
 
 pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// Initializes COM (multithreaded) on the calling thread, required for Core Audio and WinRT Toast APIs.
-pub(crate) fn init_com() {
-    unsafe {
-        let _ = windows::Win32::System::Com::CoInitializeEx(
-            None,
-            windows::Win32::System::Com::COINIT_MULTITHREADED,
-        );
-    }
 }
 
 /// Logs panics to `%LOCALAPPDATA%\taskbar-audio\diagnostics.log` and shows a friendly crash dialog in release builds.
@@ -75,7 +66,7 @@ fn main() {
     install_crash_handler();
     match std::env::args().nth(1).as_deref() {
         Some("--once") => {
-            init_com();
+            let _com = win32_raii::ComGuard::init_mta();
             diag::start();
             match audio::snapshot() {
                 Some(snap) => {

@@ -361,11 +361,39 @@ const KNOWN_COMM_APPS: &[(&str, &str)] = &[
     ("teamspeak", "TeamSpeak"),
 ];
 
+/// Lightweight refresh used by the mixer flyout's 120 ms timer: updates only per-app peak meters,
+/// volumes, and mute flags without enumerating all playback/capture hardware endpoints or opening
+/// `IPropertyStore` on every device.
+pub fn refresh_sessions_and_peaks(snap: &mut AudioSnapshot) -> bool {
+    unsafe {
+        let Ok(enumerator): Result<IMMDeviceEnumerator, _> =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER)
+        else {
+            return false;
+        };
+        let Ok(default_dev) = enumerator.GetDefaultAudioEndpoint(eRender, eConsole) else {
+            return false;
+        };
+        if let Ok(ep_vol) = default_dev.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
+            let vol_scalar = ep_vol.GetMasterVolumeLevelScalar().unwrap_or(0.0);
+            snap.master_volume = (vol_scalar.clamp(0.0, 1.0) * 100.0).round() as u8;
+            snap.master_muted = ep_vol.GetMute().map(|b| b.as_bool()).unwrap_or(false);
+        }
+        snap.sessions = read_render_sessions(&default_dev);
+        true
+    }
+}
+
 pub fn snapshot() -> Option<AudioSnapshot> {
     unsafe {
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER).ok()?;
+        snapshot_with_enumerator(&enumerator)
+    }
+}
 
+pub fn snapshot_with_enumerator(enumerator: &IMMDeviceEnumerator) -> Option<AudioSnapshot> {
+    unsafe {
         // 1. Default playback endpoint
         let default_dev = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
         let default_id = device_id(&default_dev).unwrap_or_default();
@@ -429,7 +457,7 @@ pub fn snapshot() -> Option<AudioSnapshot> {
         //    (a) Any active microphone capture session (eCapture)
         //    (b) Any active render session belonging to a known communication app (Teams/Discord/Zoom/etc.)
         //    (c) Differences between eConsole and eCommunications default session activity
-        let mut comm_app_name = check_active_capture_sessions(&enumerator);
+        let mut comm_app_name = check_active_capture_sessions(enumerator);
         for s in &mut sessions {
             if s.is_comm_app && (s.is_active || s.peak > 0.005) && comm_app_name.is_none() {
                 comm_app_name = Some(s.name.clone());
@@ -939,6 +967,10 @@ impl AudioEventWatcher {
             watcher.rebind_default_endpoint();
             Some(watcher)
         }
+    }
+
+    pub fn snapshot(&self) -> Option<AudioSnapshot> {
+        snapshot_with_enumerator(&self.enumerator)
     }
 
     /// Re-attaches `IAudioEndpointVolumeCallback` whenever the default playback device changes.

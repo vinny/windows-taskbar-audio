@@ -1,20 +1,23 @@
-//! Window plumbing for the taskbar widget:
+//! Window plumbing for the taskbar widget and Store-compliant system tray icon:
 //! - Hidden top-level `TaskbarAudioController` receives system broadcasts (`TaskbarCreated`,
 //!   `WM_SETTINGCHANGE`, `WM_DEVICECHANGE`, `WM_POWERBROADCAST`), owns the placement timer and context menu.
-//! - Visible `TaskbarAudioWidget` is a layered child window of `Shell_TrayWnd`, placed just left
-//!   of `TrayNotifyWnd` (or left of an existing taskbar widget if another one is running).
-//! - Worker thread polls Core Audio state and wakes immediately on scroll, click, or device changes.
+//! - With feature `taskbar-inject` (default GitHub/WinGet build): attaches a layered child window
+//!   (`TaskbarAudioWidget`) directly into `Shell_TrayWnd`, just left of `TrayNotifyWnd`.
+//! - Without `taskbar-inject` (e.g. `--no-default-features --features store` for MSIX/Microsoft Store):
+//!   uses an official `Shell_NotifyIconW` tray icon with live tooltip, left-click mixer, and right-click menu.
+//! - Worker thread uses persistent COM Core Audio callbacks (`AudioEventWatcher`) with a 10 s fallback poll.
 
 use crate::audio::{self, AudioSnapshot};
 use crate::i18n::{t, Lang};
-use crate::{diag, init_com, mixer, notify, render, settings, updater, wide};
+use crate::win32_raii::ComGuard;
+use crate::{diag, mixer, notify, render, settings, updater, wide};
 use std::cell::RefCell;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -26,13 +29,19 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::*;
+use windows_sys::Win32::UI::Shell::{
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFYICONDATAW,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const WM_APP_UPDATE: u32 = WM_APP + 1;
 const WM_APP_MENU: u32 = WM_APP + 2;
 const WM_APP_MIXER: u32 = WM_APP + 3;
 const WM_APP_EXIT: u32 = WM_APP + 4;
+const WM_APP_TRAY: u32 = WM_APP + 5;
 const TIMER_PLACE: usize = 1;
+const TRAY_ICON_ID: u32 = 1;
 
 const CMD_TOGGLE_MUTE: usize = 1;
 const CMD_OPEN_MIXER: usize = 2;
@@ -47,21 +56,29 @@ const CMD_OUTPUT_BASE: usize = 100;
 const CMD_INPUT_BASE: usize = 300;
 
 const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
-const POLL_AUDIO: Duration = Duration::from_secs(2);
+/// With instant COM callbacks (`IAudioEndpointVolumeCallback` + `IMMNotificationClient`),
+/// the fallback poll only needs to catch microphone/call session transitions.
+const POLL_FALLBACK: Duration = Duration::from_secs(10);
+const TRIM_INTERVAL: Duration = Duration::from_secs(60);
 
 static SNAPSHOT: Mutex<Option<AudioSnapshot>> = Mutex::new(None);
 static WAKE: OnceLock<Sender<()>> = OnceLock::new();
 static INSTANCE_MUTEX: AtomicUsize = AtomicUsize::new(0);
+/// Cross-thread accessible controller HWND so background threads (like the self-updater) can cleanly post `WM_APP_EXIT`.
+static CONTROLLER_HWND: AtomicUsize = AtomicUsize::new(0);
 pub static DEMO: AtomicBool = AtomicBool::new(false);
 
 struct App {
     controller: HWND,
     widget: HWND,
     tooltip: HWND,
+    tray_icon_added: bool,
     taskbar_created: u32,
     light: bool,
     size: (i32, i32),
     layout: Option<render::Layout>,
+    last_visual: Option<render::BarVisualKey>,
+    last_tooltip: String,
 }
 
 thread_local! {
@@ -70,10 +87,13 @@ thread_local! {
             controller: null_mut(),
             widget: null_mut(),
             tooltip: null_mut(),
+            tray_icon_added: false,
             taskbar_created: 0,
             light: false,
             size: (0, 0),
             layout: None,
+            last_visual: None,
+            last_tooltip: String::new(),
         })
     };
 }
@@ -83,6 +103,9 @@ fn with<R>(f: impl FnOnce(&mut App) -> R) -> R {
 }
 
 pub fn run() {
+    // Initialize STA COM on the UI thread for Shell/CoreAudio calls.
+    let _com = ComGuard::init_sta();
+
     unsafe {
         let mutex_name = wide(r"Local\taskbar-audio");
         let is_restarting = std::env::args().any(|a| a == "--restarting");
@@ -103,7 +126,6 @@ pub fn run() {
             }
         }
         if !acquired {
-            init_com();
             let tr = t();
             let _ = notify::show(tr.already_running_title, tr.already_running_body);
             return;
@@ -117,7 +139,7 @@ pub fn run() {
 
         if !settings::welcomed() {
             std::thread::spawn(|| {
-                init_com();
+                let _com = ComGuard::init_mta();
                 let tr = t();
                 match notify::show(tr.welcome_title, tr.welcome_body) {
                     Ok(()) => settings::set_welcomed(),
@@ -129,7 +151,9 @@ pub fn run() {
         let hinst = GetModuleHandleW(null());
         let ctrl_class = wide("TaskbarAudioController");
         register(hinst, &ctrl_class, controller_proc);
-        register(hinst, &wide("TaskbarAudioWidget"), widget_proc);
+        if use_taskbar_inject() {
+            register(hinst, &wide("TaskbarAudioWidget"), widget_proc);
+        }
         mixer::register_class();
 
         let taskbar_created = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
@@ -147,6 +171,7 @@ pub fn run() {
             hinst,
             null(),
         );
+        CONTROLLER_HWND.store(controller as usize, Ordering::SeqCst);
         with(|a| {
             a.controller = controller;
             a.taskbar_created = taskbar_created;
@@ -158,15 +183,25 @@ pub fn run() {
         let controller_addr = controller as usize;
         std::thread::spawn(move || worker(controller_addr, rx));
 
-        ensure_widget();
-        SetTimer(controller, TIMER_PLACE, 1000, None);
+        ensure_surface();
+        if use_taskbar_inject() {
+            SetTimer(controller, TIMER_PLACE, 1000, None);
+        }
 
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+
+        mixer::cleanup();
+        remove_tray_icon(controller);
+        release_instance_mutex();
     }
+}
+
+const fn use_taskbar_inject() -> bool {
+    cfg!(all(feature = "taskbar-inject", not(feature = "store")))
 }
 
 unsafe fn register(
@@ -191,24 +226,31 @@ unsafe fn register(
 
 fn worker(controller: usize, rx: Receiver<()>) {
     if DEMO.load(Ordering::Relaxed) {
-        *SNAPSHOT.lock().unwrap() = Some(audio::demo_snapshot());
+        *SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(audio::demo_snapshot());
         unsafe { PostMessageW(controller as HWND, WM_APP_UPDATE, 0, 0) };
         return;
     }
-    init_com();
+    let _com = ComGuard::init_mta();
     let mut watcher = audio::AudioEventWatcher::new(wake);
+    let mut last_trim = Instant::now();
 
     loop {
-        if let Some(w) = watcher.as_mut() {
+        let snap = if let Some(w) = watcher.as_mut() {
             w.rebind_default_endpoint();
-        }
-        if let Some(snap) = audio::snapshot() {
-            *SNAPSHOT.lock().unwrap() = Some(snap);
+            w.snapshot()
+        } else {
+            audio::snapshot()
+        };
+        if let Some(snap) = snap {
+            *SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
             unsafe { PostMessageW(controller as HWND, WM_APP_UPDATE, 0, 0) };
         }
-        trim_working_set();
+        if last_trim.elapsed() >= TRIM_INTERVAL {
+            trim_working_set();
+            last_trim = Instant::now();
+        }
 
-        match rx.recv_timeout(POLL_AUDIO) {
+        match rx.recv_timeout(POLL_FALLBACK) {
             Ok(()) => {
                 while rx.try_recv().is_ok() {}
             }
@@ -229,11 +271,79 @@ pub fn wake() {
 }
 
 fn current_snapshot() -> AudioSnapshot {
-    SNAPSHOT.lock().unwrap().clone().unwrap_or_default()
+    SNAPSHOT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
 }
 
 unsafe fn find_tray() -> HWND {
     FindWindowW(wide("Shell_TrayWnd").as_ptr(), null())
+}
+
+unsafe fn ensure_surface() {
+    if use_taskbar_inject() {
+        ensure_widget();
+    } else {
+        ensure_tray_icon();
+    }
+}
+
+unsafe fn ensure_tray_icon() {
+    let (controller, added) = with(|a| (a.controller, a.tray_icon_added));
+    if controller.is_null() || added {
+        return;
+    }
+    let mut nid: NOTIFYICONDATAW = zeroed();
+    nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = controller;
+    nid.uID = TRAY_ICON_ID;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_APP_TRAY;
+    nid.hIcon = LoadIconW(GetModuleHandleW(null()), std::ptr::without_provenance(1));
+    if nid.hIcon.is_null() {
+        nid.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
+    }
+    let tip = wide("Taskbar Audio");
+    for (dst, src) in nid.szTip.iter_mut().zip(tip.iter().take(127)) {
+        *dst = *src;
+    }
+    if Shell_NotifyIconW(NIM_ADD, &nid) != 0 {
+        with(|a| a.tray_icon_added = true);
+    }
+}
+
+unsafe fn update_tray_icon_tip(summary: &str) {
+    let (controller, added) = with(|a| (a.controller, a.tray_icon_added));
+    if controller.is_null() || !added {
+        return;
+    }
+    let mut nid: NOTIFYICONDATAW = zeroed();
+    nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = controller;
+    nid.uID = TRAY_ICON_ID;
+    nid.uFlags = NIF_TIP;
+    let tip = wide(summary);
+    for (dst, src) in nid.szTip.iter_mut().zip(tip.iter().take(127)) {
+        *dst = *src;
+    }
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+unsafe fn remove_tray_icon(controller: HWND) {
+    let added = with(|a| {
+        let was = a.tray_icon_added;
+        a.tray_icon_added = false;
+        was
+    });
+    if added && !controller.is_null() {
+        let mut nid: NOTIFYICONDATAW = zeroed();
+        nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = controller;
+        nid.uID = TRAY_ICON_ID;
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
 }
 
 unsafe fn ensure_widget() {
@@ -260,6 +370,9 @@ unsafe fn ensure_widget() {
         GetModuleHandleW(null()),
         null(),
     );
+    if w.is_null() {
+        return;
+    }
     let ex = GetWindowLongW(w, GWL_EXSTYLE) as u32;
     if ex & WS_EX_LAYOUTRTL != 0 {
         SetWindowLongW(w, GWL_EXSTYLE, (ex & !WS_EX_LAYOUTRTL) as i32);
@@ -274,6 +387,8 @@ unsafe fn ensure_widget() {
         a.tooltip = tip;
         a.size = (0, 0);
         a.layout = None;
+        a.last_visual = None;
+        a.last_tooltip.clear();
     });
     redraw();
 }
@@ -319,17 +434,42 @@ unsafe fn tool_info(widget: HWND, owner: HWND, text: &mut [u16]) -> TTTOOLINFOW 
 }
 
 unsafe fn set_tooltip_text(lines: &[String]) {
-    let (tip, widget, controller) = with(|a| (a.tooltip, a.widget, a.controller));
-    if tip.is_null() {
+    let joined = lines.join("\r\n");
+    let (tip, widget, controller, changed) = with(|a| {
+        let changed = a.last_tooltip != joined;
+        if changed {
+            a.last_tooltip = joined.clone();
+        }
+        (a.tooltip, a.widget, a.controller, changed)
+    });
+    if tip.is_null() || !changed {
         return;
     }
-    let mut text = wide(&lines.join("\r\n"));
+    let mut text = wide(&joined);
     let ti = tool_info(widget, controller, &mut text);
     SendMessageW(tip, TTM_UPDATETIPTEXTW, 0, &ti as *const _ as LPARAM);
 }
 
 unsafe fn redraw() {
-    let (widget, light) = with(|a| (a.widget, a.light));
+    let light = with(|a| a.light);
+    let snap = current_snapshot();
+    let tr = t();
+
+    let vol_str = if snap.master_muted {
+        format!("{}% ({})", snap.master_volume, tr.muted)
+    } else {
+        format!("{}%", snap.master_volume)
+    };
+
+    if !use_taskbar_inject() {
+        ensure_tray_icon();
+        let summary = format!("{} — {}", snap.device_short_name, vol_str);
+        update_tray_icon_tip(&summary);
+        mixer::refresh_if_visible(snap, light);
+        return;
+    }
+
+    let widget = with(|a| a.widget);
     if widget.is_null() || IsWindow(widget) == 0 {
         return;
     }
@@ -339,15 +479,8 @@ unsafe fn redraw() {
     }
     let layout = taskbar_layout(tray);
     let dpi = GetDpiForWindow(tray).max(96);
-    let snap = current_snapshot();
-    let tr = t();
 
     let mut tip_lines = Vec::new();
-    let vol_str = if snap.master_muted {
-        format!("{}% ({})", snap.master_volume, tr.muted)
-    } else {
-        format!("{}%", snap.master_volume)
-    };
     tip_lines.push(format!("{}: {}", snap.device_name, vol_str));
     if snap.in_communication {
         if let Some(app) = &snap.comm_app_name {
@@ -367,12 +500,17 @@ unsafe fn redraw() {
     set_tooltip_text(&tip_lines);
 
     let show_dev = settings::show_device_name();
-    let size = render::draw(widget, &snap, show_dev, dpi, layout, light);
-    with(|a| {
-        a.size = size;
-        a.layout = Some(layout);
-    });
-    place();
+    let key = render::BarVisualKey::from_state(&snap, show_dev, dpi, layout, light);
+    let needs_paint = with(|a| a.last_visual.as_ref() != Some(&key));
+    if needs_paint {
+        let size = render::draw(widget, &snap, show_dev, dpi, layout, light);
+        with(|a| {
+            a.size = size;
+            a.layout = Some(layout);
+            a.last_visual = Some(key);
+        });
+        place();
+    }
     mixer::refresh_if_visible(snap, light);
 }
 
@@ -398,6 +536,7 @@ unsafe fn place() {
         return;
     }
     if rendered != Some(taskbar_layout(tray)) {
+        with(|a| a.last_visual = None);
         redraw();
         return;
     }
@@ -455,8 +594,10 @@ unsafe fn place() {
         || cur.top - tr.top != y
         || cur.right - cur.left != width
         || cur.bottom - cur.top != height;
-    let on_top = GetWindow(tray, GW_CHILD) == widget;
-    if moved || !on_top || IsWindowVisible(widget) == 0 {
+    // Avoid fighting Z-order with TaskbarBatteryWidget on every timer tick; only raise if behind XAML
+    let top_child = GetWindow(tray, GW_CHILD);
+    let near_top = top_child == widget || (has_battery && top_child == battery_sibling);
+    if moved || !near_top || IsWindowVisible(widget) == 0 {
         SetWindowPos(
             widget,
             HWND_TOP,
@@ -602,26 +743,33 @@ unsafe fn show_menu(hwnd: HWND) {
 
     // 4. Settings & actions
     let checked = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
-    AppendMenuW(
-        menu,
-        MF_STRING | checked(settings::show_device_name()),
-        CMD_SHOW_DEVICE_NAME,
-        keep(&mut labels, tr.show_device_name_on_bar),
-    );
-    AppendMenuW(
-        menu,
-        MF_STRING | checked(settings::autostart_enabled()),
-        CMD_AUTOSTART,
-        keep(&mut labels, tr.start_with_windows),
-    );
+    if use_taskbar_inject() {
+        AppendMenuW(
+            menu,
+            MF_STRING | checked(settings::show_device_name()),
+            CMD_SHOW_DEVICE_NAME,
+            keep(&mut labels, tr.show_device_name_on_bar),
+        );
+    }
+    if !cfg!(feature = "store") {
+        AppendMenuW(
+            menu,
+            MF_STRING | checked(settings::autostart_enabled()),
+            CMD_AUTOSTART,
+            keep(&mut labels, tr.start_with_windows),
+        );
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
-    let check_updates_label = format!("{} (v{})", tr.check_updates, env!("CARGO_PKG_VERSION"));
-    AppendMenuW(
-        menu,
-        MF_STRING,
-        CMD_CHECK_UPDATES,
-        keep(&mut labels, &check_updates_label),
-    );
+    #[cfg(feature = "self-update")]
+    {
+        let check_updates_label = format!("{} (v{})", tr.check_updates, env!("CARGO_PKG_VERSION"));
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            CMD_CHECK_UPDATES,
+            keep(&mut labels, &check_updates_label),
+        );
+    }
     AppendMenuW(
         menu,
         MF_STRING,
@@ -643,13 +791,14 @@ unsafe fn show_menu(hwnd: HWND) {
         null(),
     );
     PostMessageW(hwnd, WM_NULL, 0, 0);
+    // DestroyMenu recursively destroys attached submenus (input_menu and lang_menu)
     DestroyMenu(menu);
 
     match cmd as usize {
         0 => {}
         CMD_TOGGLE_MUTE => {
             audio::toggle_master_mute();
-            if let Some(s) = SNAPSHOT.lock().unwrap().as_mut() {
+            if let Some(s) = SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                 s.master_muted = !s.master_muted;
             }
             redraw();
@@ -658,6 +807,7 @@ unsafe fn show_menu(hwnd: HWND) {
         CMD_OPEN_MIXER => toggle_mixer_flyout(),
         CMD_SHOW_DEVICE_NAME => {
             settings::set_show_device_name(!settings::show_device_name());
+            with(|a| a.last_visual = None);
             redraw();
         }
         CMD_AUTOSTART => {
@@ -670,11 +820,13 @@ unsafe fn show_menu(hwnd: HWND) {
         CMD_EXIT => request_exit(),
         CMD_LANG_AUTO => {
             settings::set_language_override(None);
+            with(|a| a.last_visual = None);
             redraw();
         }
         c if (CMD_LANG_BASE..CMD_LANG_BASE + Lang::ALL.len()).contains(&c) => {
             let lang = Lang::ALL[c - CMD_LANG_BASE];
             settings::set_language_override(Some(lang));
+            with(|a| a.last_visual = None);
             redraw();
         }
         c if (CMD_OUTPUT_BASE..CMD_INPUT_BASE).contains(&c) => {
@@ -706,32 +858,45 @@ pub fn release_instance_mutex() {
     }
 }
 
+/// Thread-safe exit trigger: uses the atomic `CONTROLLER_HWND` so background threads (such as
+/// `updater::check_in_background`) can reliably close the running UI thread.
 fn request_exit() {
     release_instance_mutex();
-    let controller = with(|a| a.controller);
+    let controller = CONTROLLER_HWND.load(Ordering::SeqCst) as HWND;
     if !controller.is_null() {
         unsafe { PostMessageW(controller, WM_APP_EXIT, 0, 0) };
     }
 }
 
 unsafe fn toggle_mixer_flyout() {
-    let (widget, light) = with(|a| (a.widget, a.light));
-    if widget.is_null() || IsWindow(widget) == 0 {
-        return;
-    }
+    let light = with(|a| a.light);
     let tray = find_tray();
-    if tray.is_null() {
-        return;
-    }
-    let mut rc: RECT = zeroed();
-    GetWindowRect(widget, &mut rc);
+    let anchor_rc = if use_taskbar_inject() {
+        let widget = with(|a| a.widget);
+        if widget.is_null() || IsWindow(widget) == 0 {
+            return;
+        }
+        let mut rc: RECT = zeroed();
+        GetWindowRect(widget, &mut rc);
+        rc
+    } else {
+        let mut pt: POINT = zeroed();
+        GetCursorPos(&mut pt);
+        RECT {
+            left: pt.x - 12,
+            top: pt.y - 12,
+            right: pt.x + 12,
+            bottom: pt.y + 12,
+        }
+    };
+
     let snap = if DEMO.load(Ordering::Relaxed) {
         current_snapshot()
     } else {
         audio::snapshot().unwrap_or_else(current_snapshot)
     };
-    *SNAPSHOT.lock().unwrap() = Some(snap.clone());
-    mixer::toggle(rc, tray, snap, light, || {
+    *SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap.clone());
+    mixer::toggle(anchor_rc, tray, snap, light, || {
         wake();
     });
 }
@@ -744,7 +909,7 @@ unsafe fn copy_diagnostics(hwnd: HWND) {
         None => (tr.diag_empty_title, tr.diag_empty_body),
     };
     std::thread::spawn(move || {
-        init_com();
+        let _com = ComGuard::init_mta();
         let _ = notify::show(title, body);
     });
 }
@@ -787,11 +952,16 @@ unsafe extern "system" fn controller_proc(
     match msg {
         WM_APP_UPDATE => redraw(),
         WM_TIMER => {
-            ensure_widget();
-            place();
+            if use_taskbar_inject() {
+                ensure_widget();
+                place();
+            }
         }
         WM_SETTINGCHANGE => {
-            with(|a| a.light = settings::light_theme());
+            with(|a| {
+                a.light = settings::light_theme();
+                a.last_visual = None;
+            });
             redraw();
         }
         WM_DEVICECHANGE => {
@@ -804,10 +974,23 @@ unsafe extern "system" fn controller_proc(
             }
             return 1;
         }
+        WM_APP_TRAY => {
+            let ev = (lp & 0xFFFF) as u32;
+            match ev {
+                WM_LBUTTONUP => toggle_mixer_flyout(),
+                WM_RBUTTONUP => show_menu(hwnd),
+                WM_MBUTTONUP => {
+                    audio::toggle_master_mute();
+                    wake();
+                }
+                _ => {}
+            }
+        }
         WM_APP_MENU => show_menu(hwnd),
         WM_APP_MIXER => toggle_mixer_flyout(),
         WM_APP_EXIT => {
-            mixer::hide();
+            mixer::cleanup();
+            remove_tray_icon(hwnd);
             let widget = with(|a| a.widget);
             if !widget.is_null() {
                 DestroyWindow(widget);
@@ -816,8 +999,12 @@ unsafe extern "system" fn controller_proc(
         }
         WM_DESTROY => PostQuitMessage(0),
         m if m == taskbar_created && m != 0 => {
-            with(|a| a.widget = null_mut());
-            ensure_widget();
+            with(|a| {
+                a.widget = null_mut();
+                a.tray_icon_added = false;
+                a.last_visual = None;
+            });
+            ensure_surface();
         }
         _ => return DefWindowProcW(hwnd, msg, wp, lp),
     }
@@ -838,7 +1025,7 @@ unsafe extern "system" fn widget_proc(
         }
         WM_MBUTTONUP => {
             audio::toggle_master_mute();
-            if let Some(s) = SNAPSHOT.lock().unwrap().as_mut() {
+            if let Some(s) = SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                 s.master_muted = !s.master_muted;
             }
             let controller = with(|a| a.controller);
@@ -855,7 +1042,7 @@ unsafe extern "system" fn widget_proc(
             let delta = ((wp >> 16) as i16) as i32;
             let step = if delta > 0 { 2 } else { -2 };
             audio::step_master_volume(step);
-            if let Some(s) = SNAPSHOT.lock().unwrap().as_mut() {
+            if let Some(s) = SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                 s.master_volume = (s.master_volume as i32 + step).clamp(0, 100) as u8;
                 if step > 0 && s.master_volume > 0 {
                     s.master_muted = false;

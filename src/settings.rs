@@ -115,7 +115,8 @@ pub fn set_autostart(on: bool) {
 }
 
 pub fn ensure_autostart() {
-    if cfg!(debug_assertions) || read_dword(APP_KEY, "AutostartOptOut") == Some(1) {
+    // Microsoft Store policy 10.3.2 forbids enabling startup without explicit user consent.
+    if cfg!(feature = "store") || cfg!(debug_assertions) || read_dword(APP_KEY, "AutostartOptOut") == Some(1) {
         return;
     }
     write_run_entry(true);
@@ -156,19 +157,41 @@ pub fn set_language_override(lang: Option<Lang>) {
 }
 
 pub fn github_repo() -> String {
-    if let Ok(env_repo) = std::env::var("TASKBAR_AUDIO_REPO") {
-        if !env_repo.trim().is_empty() {
-            return env_repo;
+    // Only allow overriding the update repository in debug builds to prevent HKCU hijack in production.
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(env_repo) = std::env::var("TASKBAR_AUDIO_REPO") {
+            let trimmed = env_repo.trim();
+            if is_valid_github_repo(trimmed) {
+                return trimmed.to_string();
+            }
         }
     }
-    read_string(APP_KEY, "GitHubRepo")
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_GITHUB_REPO.to_string())
+    DEFAULT_GITHUB_REPO.to_string()
+}
+
+#[cfg(any(debug_assertions, test))]
+fn is_valid_github_repo(repo: &str) -> bool {
+    let mut parts = repo.split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let valid_part = |s: &str| {
+        !s.is_empty()
+            && !s.contains("..")
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    valid_part(owner) && valid_part(name)
 }
 
 const NOTIFICATION_ICON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icon-64.png"));
 
 pub fn register_app_id() {
+    // MSIX packages declare their AUMID in AppxManifest.xml; avoid writing HKCU\Software\Classes.
+    if cfg!(feature = "store") {
+        return;
+    }
     let key = format!(r"Software\Classes\AppUserModelId\{}", crate::notify::APP_ID);
     write_string(&key, "DisplayName", "Taskbar Audio");
     if let Some(dir) = std::env::var_os("LOCALAPPDATA")
